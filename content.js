@@ -1,12 +1,11 @@
 // ============================================================
 // Ad Highlighter v2 — Content Script
-// Injected into every page to detect and highlight ads
+// Two-layer detection: site-specific rules + generic island analysis
 // ============================================================
 
 (function () {
   "use strict";
 
-  // Don't run in iframes that are already flagged, or on extension pages
   if (window.__adHighlighterV2Loaded) return;
   window.__adHighlighterV2Loaded = true;
 
@@ -14,36 +13,7 @@
   // 1. CONFIGURATION
   // ----------------------------------------------------------
 
-  // Keywords that strongly suggest ad content when found in text.
-  // These are checked as whole words (word-boundary regex).
-  const AD_KEYWORDS = [
-    "sponsored",
-    "promoted",
-    "advertisement",
-    "paid partnership",
-    "paid promotion",
-    "affiliate link",
-    "affiliate",
-    "advertorial",
-    "#ad",
-    "ad disclosure",
-    "contains paid",
-    "paid collaboration",
-    "in partnership with",
-    "presented by",
-    "brought to you by",
-    "powered by our sponsors",
-    "powered by",
-  ];
-
-  // Shorter/ambiguous keywords that need extra context to avoid
-  // false positives (like your dictionary screenshot!)
-  const CONTEXTUAL_KEYWORDS = [
-    "ad", // only if parent looks like a label/badge
-    "ads",
-  ];
-
-  // CSS class/id substrings that commonly indicate ad containers
+  // CSS class/id patterns for ad containers (used by findAdContainer & island scoring)
   const AD_CLASS_PATTERNS = [
     "ad-container",
     "ad-wrapper",
@@ -77,7 +47,6 @@
     "googlesyndication.com",
     "googleadservices.com",
     "amazon-adsystem.com",
-    "facebook.com/plugins",
     "adnxs.com",
     "criteo.com",
     "outbrain.com",
@@ -92,10 +61,16 @@
     "media.net",
   ];
 
-  // aria-label values that indicate ads
-  const AD_ARIA_PATTERNS = ["advertisement", "sponsored", "promoted", "ad"];
+  // Soft-signal keywords (only for scoring in fallback, never standalone detection)
+  const SOFT_KEYWORDS = [
+    "sponsored",
+    "promoted",
+    "advertisement",
+    "advertorial",
+    "ad disclosure",
+    "paid partnership",
+  ];
 
-  // Tags we should never highlight as ad containers (too structural)
   const EXCLUDED_TAGS = new Set([
     "HTML",
     "BODY",
@@ -112,7 +87,6 @@
     "TITLE",
   ]);
 
-  // Tags that are natural "container" boundaries when walking up the DOM
   const CONTAINER_TAGS = new Set([
     "ARTICLE",
     "SECTION",
@@ -130,16 +104,14 @@
   // ----------------------------------------------------------
 
   let enabled = true;
-  let highlightedElements = new Map(); // element -> { reason, overlay }
-  let dismissedSelectors = new Set(); // per-domain dismissed items
+  let highlightedElements = new Map();
+  let dismissedSelectors = new Set();
   const domain = window.location.hostname;
 
-  // Load state from storage
   chrome.storage.local.get(["enabled", `dismissed_${domain}`], (result) => {
     if (result.enabled === false) {
       enabled = false;
     } else {
-      // Default to enabled
       enabled = true;
       scanPage();
     }
@@ -148,8 +120,7 @@
     }
   });
 
-  // Listen for toggle messages from popup
-  chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     if (msg.type === "toggle") {
       enabled = msg.enabled;
       if (enabled) {
@@ -175,25 +146,25 @@
 
   function scanPage() {
     if (!enabled) return;
-
     const found = new Set();
 
-    // Strategy A: Keyword scanning in text nodes
-    detectByKeywords(found);
+    // Layer 1: Site-specific detection for known sites
+    const siteDetector = getSiteDetector();
+    if (siteDetector) {
+      console.log("[AdHighlighter] Using site-specific detector for:", domain);
+      siteDetector(found);
+    } else {
+      // Layer 2: Generic fallback for unknown sites only
+      console.log(
+        "[AdHighlighter] No site rules, using generic detection for:",
+        domain,
+      );
+      detectAdIframes(found);
+      detectByIslandAnalysis(found);
+    }
 
-    // Strategy B: CSS class/id pattern matching
-    detectByClassPatterns(found);
+    console.log("[AdHighlighter] Scan complete. Elements found:", found.size);
 
-    // Strategy C: Ad-serving iframes
-    detectByIframes(found);
-
-    // Strategy D: ARIA labels
-    detectByAriaLabels(found);
-
-    // Strategy E: Common ad element structures
-    detectByStructure(found);
-
-    // Highlight everything we found
     found.forEach((el) => {
       if (!highlightedElements.has(el) && !isDismissed(el)) {
         highlightElement(el);
@@ -203,122 +174,544 @@
     updateBadge();
   }
 
-  // --- Strategy A: Keywords in visible text ---
-  function detectByKeywords(found) {
+  function getSiteDetector() {
+    if (/(?:^|\.)google\.\w+(\.\w+)?$/.test(domain)) return detectGoogleAds;
+    if (/(?:^|\.)youtube\.com$/.test(domain)) return detectYouTubeAds;
+    if (/(?:^|\.)facebook\.com$/.test(domain)) return detectFacebookAds;
+    if (/(?:^|\.)instagram\.com$/.test(domain)) return detectInstagramAds;
+    if (/(?:^|\.)amazon\.\w+(\.\w+)?$/.test(domain)) return detectAmazonAds;
+    if (/(?:^|\.)linkedin\.com$/.test(domain)) return detectLinkedInAds;
+    if (
+      /(?:^|\.)twitter\.com$/.test(domain) ||
+      /(?:^|\.)x\.com$/.test(domain)
+    )
+      return detectTwitterAds;
+    if (/(?:^|\.)reddit\.com$/.test(domain)) return detectRedditAds;
+    if (/(?:^|\.)booking\.com$/.test(domain)) return detectBookingAds;
+    return null;
+  }
+
+  // ---- Site-specific detectors ----
+
+  function detectGoogleAds(found) {
+    // 1. Traditional wrapper IDs — highlight directly (these contain ad blocks)
+    for (const id of ["tads", "bottomads"]) {
+      const container = document.getElementById(id);
+      if (container) {
+        console.log("[AdHighlighter] Google: found #" + id, {
+          childCount: container.children.length,
+        });
+        found.add(container);
+      }
+    }
+
+    // 2. Elements with data-text-ad attribute — highlight the element DIRECTLY
+    //    (do NOT use findAdContainer which walks to wrong parent)
+    document.querySelectorAll("[data-text-ad]").forEach((el) => {
+      if (!found.has(el)) {
+        console.log("[AdHighlighter] Google: found [data-text-ad]", {
+          tag: el.tagName,
+          class: el.className,
+          id: el.id,
+        });
+        found.add(el);
+      }
+    });
+
+    // 3. "Sponsored" / "Sponsored result(s)" heading text
+    //    Walk up to find the parent section that contains the heading AND the
+    //    ad listings below it. Do NOT use findAdContainer.
+    const walker = document.createTreeWalker(
+      document.body,
+      NodeFilter.SHOW_TEXT,
+      null,
+    );
+    let node;
+    while ((node = walker.nextNode())) {
+      const text = node.textContent.trim().toLowerCase();
+      if (
+        text === "sponsored" ||
+        text === "sponsored result" ||
+        text === "sponsored results"
+      ) {
+        const parentEl = node.parentElement;
+        if (!parentEl) continue;
+
+        console.log(
+          "[AdHighlighter] Google: found '" + text + "' text node in <" + parentEl.tagName.toLowerCase() + ">",
+          {
+            class: parentEl.className,
+            parentTag: parentEl.parentElement?.tagName,
+            parentClass: parentEl.parentElement?.className,
+          },
+        );
+
+        // First check if already inside a data-text-ad or #tads/#bottomads
+        const existingAd = walkUpTo(parentEl, (ancestor) => {
+          if (ancestor.getAttribute("data-text-ad") !== null) return true;
+          if (ancestor.id === "tads" || ancestor.id === "bottomads") return true;
+          return false;
+        });
+        if (existingAd) {
+          console.log("[AdHighlighter] Google: Sponsored text already inside known ad container, skipping");
+          continue;
+        }
+
+        // Walk up to find a section that contains both the heading and
+        // ad result listings (multiple child divs with links)
+        const section = walkUpTo(
+          parentEl,
+          (ancestor) => {
+            // Look for a container with the heading + multiple ad-like children
+            if (ancestor.children.length < 2) return false;
+            // Check if it has data-text-ad descendants (the actual ads)
+            const adDescendants = ancestor.querySelectorAll("[data-text-ad]");
+            if (adDescendants.length > 0) return true;
+            // Or check if it has multiple child divs with links (ad cards)
+            let childrenWithLinks = 0;
+            for (const child of ancestor.children) {
+              if (child.querySelector("a[href]")) childrenWithLinks++;
+            }
+            return childrenWithLinks >= 2;
+          },
+          10,
+        );
+
+        if (section) {
+          console.log("[AdHighlighter] Google: flagging Sponsored section", {
+            tag: section.tagName,
+            class: section.className,
+            id: section.id,
+            childCount: section.children.length,
+          });
+          found.add(section);
+        } else {
+          console.log(
+            "[AdHighlighter] Google: Sponsored text found but no suitable section, skipping",
+          );
+        }
+      }
+    }
+  }
+
+  function detectYouTubeAds(found) {
+    // Ad slot renderers in feed/sidebar
+    const adSelectors = [
+      "ytd-ad-slot-renderer",
+      "ytd-promoted-sparkles-web-renderer",
+      "ytd-display-ad-renderer",
+      "ytd-promoted-video-renderer",
+    ];
+    for (const sel of adSelectors) {
+      document.querySelectorAll(sel).forEach((el) => {
+        console.log("[AdHighlighter] YouTube: found " + sel);
+        found.add(el);
+      });
+    }
+
+    // "Sponsored" badges in feed
+    document.querySelectorAll("span").forEach((span) => {
+      if (span.textContent.trim().toLowerCase() === "sponsored") {
+        const container = findAdContainer(span);
+        if (container) {
+          console.log("[AdHighlighter] YouTube: 'Sponsored' badge", {
+            containerTag: container.tagName,
+            containerClass: container.className,
+          });
+          found.add(container);
+        }
+      }
+    });
+
+    // Video player ads
+    const adModule = document.querySelector(".ytp-ad-module");
+    if (adModule && adModule.children.length > 0) {
+      console.log("[AdHighlighter] YouTube: video ad module active");
+      found.add(adModule);
+    }
+    const adShowing = document.querySelector(".ad-showing");
+    if (adShowing) {
+      console.log("[AdHighlighter] YouTube: player in ad-showing state");
+      found.add(adShowing);
+    }
+  }
+
+  function detectFacebookAds(found) {
+    // Use TreeWalker to scan ALL text nodes for ad labels.
+    // Facebook renders "Sponsored", "Ad", "Ad · 🌐", "Sponsored · 🌐" etc.
+    // in various nested span structures that querySelectorAll can miss.
     const walker = document.createTreeWalker(
       document.body,
       NodeFilter.SHOW_TEXT,
       null,
     );
 
-    let node;
-    while ((node = walker.nextNode())) {
-      const text = node.textContent.trim().toLowerCase();
-      if (!text) continue;
+    let textNode;
+    while ((textNode = walker.nextNode())) {
+      const raw = textNode.textContent.trim();
+      if (!raw) continue;
+      const lower = raw.toLowerCase();
 
-      // Check strong keywords (whole word match)
-      for (const kw of AD_KEYWORDS) {
-        const regex = new RegExp(`\\b${escapeRegex(kw)}\\b`, "i");
-        if (regex.test(text)) {
-          const container = findAdContainer(node.parentElement);
-          console.log("[AdHighlighter] Keyword match:", {
-            keyword: kw,
-            text: text.slice(0, 120),
-            parentTag: node.parentElement?.tagName,
-            parentClass: node.parentElement?.className,
-            container: container
-              ? { tag: container.tagName, class: container.className, id: container.id }
-              : null,
-          });
-          if (container) {
-            found.add(container);
-          }
-          break;
-        }
+      // Match: "sponsored", "ad", or "ad" / "sponsored" followed by separator (· • etc)
+      const isSponsoredLabel = lower === "sponsored" || /^sponsored\s*[\u00B7\u2022\u2027·•]/.test(lower);
+      const isAdLabel = lower === "ad" || /^ad\s*[\u00B7\u2022\u2027·•]/.test(lower);
+
+      if (!isSponsoredLabel && !isAdLabel) continue;
+
+      const parentEl = textNode.parentElement;
+      if (!parentEl) continue;
+
+      // Skip if parent is too large (avoid matching page-level text)
+      if (parentEl.tagName === "BODY" || parentEl.tagName === "HTML") continue;
+
+      console.log(
+        "[AdHighlighter] Facebook: found '" + raw + "' text node in <" + parentEl.tagName.toLowerCase() + ">",
+        {
+          class: parentEl.className,
+          parentTag: parentEl.parentElement?.tagName,
+          parentClass: parentEl.parentElement?.className,
+        },
+      );
+
+      // --- Tier 1: walk up looking for role="article" (up to 20 levels) ---
+      const article = walkUpTo(
+        parentEl,
+        (ancestor) => ancestor.getAttribute("role") === "article",
+        20,
+      );
+      if (article) {
+        console.log("[AdHighlighter] Facebook: flagging feed ad post (role=article)");
+        found.add(article);
+        continue;
       }
 
-      // Check contextual keywords (need extra validation)
-      for (const kw of CONTEXTUAL_KEYWORDS) {
-        const regex = new RegExp(`\\b${escapeRegex(kw)}\\b`, "i");
-        if (regex.test(text)) {
-          const parent = node.parentElement;
-          if (parent && looksLikeAdLabel(parent)) {
-            const container = findAdContainer(parent);
-            if (container) {
-              found.add(container);
+      console.log("[AdHighlighter] Facebook: no role=article found, trying feed-width heuristic");
+
+      // --- Tier 2: walk up looking for a feed-post-sized container ---
+      // Facebook feed posts are consistently ~500-700px wide. Look for a
+      // container that is 400-800px wide AND contains text + an image or link.
+      let feedPost = null;
+      {
+        let el = parentEl;
+        for (let i = 0; i < 20; i++) {
+          el = el.parentElement;
+          if (!el || el.tagName === "BODY" || el.tagName === "HTML") break;
+          const rect = el.getBoundingClientRect();
+          const cls = typeof el.className === "string" ? el.className : "";
+          console.log(
+            "[AdHighlighter] Facebook walk step " + i + ":",
+            el.tagName,
+            cls.substring(0, 50),
+            el.getAttribute("role"),
+            Math.round(rect.width),
+          );
+          if (rect.width >= 400 && rect.width <= 800) {
+            const hasImage = el.querySelector("img");
+            const hasLink = el.querySelector("a[href]");
+            const hasText = el.textContent.trim().length > 50;
+            if (hasText && (hasImage || hasLink)) {
+              feedPost = el;
+              // Don't break — keep walking to find the outermost
+              // feed-width container (the actual post boundary)
             }
           }
-          break;
+          // Stop if we've gone past feed width (too wide = page column)
+          if (rect.width > 900) break;
+        }
+      }
+      if (feedPost) {
+        console.log("[AdHighlighter] Facebook: flagging feed ad post (width heuristic)", {
+          tag: feedPost.tagName,
+          class: (typeof feedPost.className === "string" ? feedPost.className : "").substring(0, 80),
+          width: Math.round(feedPost.getBoundingClientRect().width),
+        });
+        found.add(feedPost);
+        continue;
+      }
+
+      console.log("[AdHighlighter] Facebook: width heuristic failed, using depth fallback");
+
+      // --- Tier 3: brute-force walk up 10 levels from the text node ---
+      // Better to highlight an imperfect container than nothing at all.
+      // For sidebar "Sponsored" headings, try to find individual cards first.
+      if (isSponsoredLabel) {
+        const section = walkUpTo(
+          parentEl,
+          (ancestor) => {
+            return (
+              ancestor.children.length >= 2 &&
+              ancestor.children.length <= 12
+            );
+          },
+          8,
+        );
+        if (section) {
+          let cardsFound = 0;
+          for (const child of section.children) {
+            if (!child.contains(parentEl) && child.querySelector("a[href]")) {
+              console.log("[AdHighlighter] Facebook: sidebar ad card", {
+                tag: child.tagName,
+                class: child.className,
+              });
+              found.add(child);
+              cardsFound++;
+            }
+          }
+          if (cardsFound > 0) continue;
+        }
+      }
+
+      // Last resort: walk up exactly 10 levels and use whatever we land on
+      {
+        let el = parentEl;
+        for (let i = 0; i < 10; i++) {
+          if (!el.parentElement || el.parentElement.tagName === "BODY" || el.parentElement.tagName === "HTML") break;
+          el = el.parentElement;
+        }
+        if (el !== parentEl) {
+          console.log("[AdHighlighter] Facebook: flagging via depth fallback (10 levels up)", {
+            tag: el.tagName,
+            class: (typeof el.className === "string" ? el.className : "").substring(0, 80),
+            width: Math.round(el.getBoundingClientRect().width),
+          });
+          found.add(el);
         }
       }
     }
-  }
 
-  // Check if a short keyword like "ad" is being used as a label/badge
-  // rather than in normal prose (avoids the dictionary problem)
-  function looksLikeAdLabel(element) {
-    // Only flag "ad"/"ads" if the element's entire visible text is exactly that
-    // (i.e., it's a standalone label/badge, not a dictionary definition or prose)
-    const fullText = element.textContent.trim().toLowerCase();
-    if (fullText === "ad" || fullText === "ads") return true;
-
-    // Or if the element (or its parent) has an ad-related class/ID
-    if (elementMatchesAnyAdPattern(element)) return true;
-    if (
-      element.parentElement &&
-      elementMatchesAnyAdPattern(element.parentElement)
-    )
-      return true;
-
-    // Or if the element has an ad-related aria attribute
-    const ariaLabel = (element.getAttribute("aria-label") || "")
-      .toLowerCase()
-      .trim();
-    if (AD_ARIA_PATTERNS.some((p) => ariaLabel === p)) return true;
-
-    return false;
-  }
-
-  // --- Strategy B: Class/ID pattern matching ---
-  function detectByClassPatterns(found) {
-    for (const pattern of AD_CLASS_PATTERNS) {
-      // Use CSS selector as a fast pre-filter, then verify with
-      // segment-bounded matching to avoid substring false positives
-      // (e.g. "broad-container" should NOT match pattern "ad-container")
-      const byClass = document.querySelectorAll(`[class*="${pattern}"]`);
-      byClass.forEach((el) => {
-        if (!EXCLUDED_TAGS.has(el.tagName)) {
-          const classes = (
-            typeof el.className === "string" ? el.className : ""
-          ).toLowerCase();
-          if (containsAdSegment(classes, pattern)) {
-            found.add(el);
-          }
+    // --- Links to ads about/transparency page ---
+    document
+      .querySelectorAll('a[href*="about/ads"], a[href*="/ads/about"]')
+      .forEach((link) => {
+        const article = walkUpTo(
+          link,
+          (ancestor) => ancestor.getAttribute("role") === "article",
+          20,
+        );
+        if (article && !found.has(article)) {
+          console.log("[AdHighlighter] Facebook: ad post via ads-about link");
+          found.add(article);
         }
       });
+  }
 
-      // Search by ID
-      const byId = document.querySelectorAll(`[id*="${pattern}"]`);
-      byId.forEach((el) => {
-        if (!EXCLUDED_TAGS.has(el.tagName)) {
-          const id = (el.id || "").toLowerCase();
-          if (containsAdSegment(id, pattern)) {
-            found.add(el);
+  function detectInstagramAds(found) {
+    // "Sponsored" label under username
+    document.querySelectorAll("span").forEach((span) => {
+      if (span.textContent.trim().toLowerCase() === "sponsored") {
+        const article = walkUpTo(span, (el) => el.tagName === "ARTICLE");
+        if (article) {
+          console.log("[AdHighlighter] Instagram: sponsored post found");
+          found.add(article);
+        }
+      }
+    });
+
+    // Links to ads about page
+    document
+      .querySelectorAll('a[href*="about/ads"], a[href*="/ads/about"]')
+      .forEach((link) => {
+        const article = walkUpTo(link, (el) => el.tagName === "ARTICLE");
+        if (article) {
+          console.log(
+            "[AdHighlighter] Instagram: ad post via ads-about link",
+          );
+          found.add(article);
+        }
+      });
+  }
+
+  function detectAmazonAds(found) {
+    // Sponsored result containers (data attribute)
+    document
+      .querySelectorAll('[data-component-type="sp-sponsored-result"]')
+      .forEach((el) => {
+        console.log("[AdHighlighter] Amazon: found sp-sponsored-result", {
+          class: el.className,
+        });
+        found.add(el);
+      });
+
+    // Sponsored labels with Amazon-specific classes
+    for (const sel of [
+      "span.puis-label-popover-default",
+      "span.s-label-popover-default",
+    ]) {
+      document.querySelectorAll(sel).forEach((span) => {
+        if (span.textContent.trim().toLowerCase() === "sponsored") {
+          const container = findAdContainer(span);
+          if (container) {
+            console.log("[AdHighlighter] Amazon: 'Sponsored' label (" + sel + ")", {
+              containerTag: container.tagName,
+            });
+            found.add(container);
           }
         }
       });
     }
+
+    // Fallback: search result items containing a "Sponsored" span
+    document.querySelectorAll(".s-result-item").forEach((item) => {
+      for (const span of item.querySelectorAll("span")) {
+        if (span.textContent.trim().toLowerCase() === "sponsored") {
+          console.log("[AdHighlighter] Amazon: sponsored result item", {
+            asin: item.getAttribute("data-asin"),
+          });
+          found.add(item);
+          break;
+        }
+      }
+    });
   }
 
-  // --- Strategy C: Ad-serving iframes ---
-  function detectByIframes(found) {
-    const iframes = document.querySelectorAll("iframe");
-    iframes.forEach((iframe) => {
+  function detectLinkedInAds(found) {
+    // Use TreeWalker to scan ALL text nodes for "Promoted" label.
+    // LinkedIn nests the label deeply in spans that querySelectorAll may miss.
+    const walker = document.createTreeWalker(
+      document.body,
+      NodeFilter.SHOW_TEXT,
+      null,
+    );
+
+    let textNode;
+    while ((textNode = walker.nextNode())) {
+      if (textNode.textContent.trim().toLowerCase() !== "promoted") continue;
+
+      const parentEl = textNode.parentElement;
+      if (!parentEl) continue;
+
+      console.log("[AdHighlighter] LinkedIn: found 'Promoted' text node in <" + parentEl.tagName.toLowerCase() + ">", {
+        class: parentEl.className,
+        parentTag: parentEl.parentElement?.tagName,
+        parentClass: parentEl.parentElement?.className,
+      });
+
+      // Walk up to feed post container. LinkedIn uses several patterns:
+      //   - div[data-urn] (post URN identifier)
+      //   - div[data-id] (alternative post identifier)
+      //   - div with class containing "feed-shared-update"
+      //   - div with class containing "occludable-update"
+      const post = walkUpTo(parentEl, (el) => {
+        if (el.getAttribute("data-urn") !== null) return true;
+        if (el.getAttribute("data-id") !== null && el.tagName === "DIV")
+          return true;
+        const cls = (
+          typeof el.className === "string" ? el.className : ""
+        ).toLowerCase();
+        if (cls.includes("feed-shared-update")) return true;
+        if (cls.includes("occludable-update")) return true;
+        return false;
+      }, 20);
+
+      if (post) {
+        console.log("[AdHighlighter] LinkedIn: promoted post container", {
+          tag: post.tagName,
+          class: post.className,
+          dataUrn: post.getAttribute("data-urn"),
+          dataId: post.getAttribute("data-id"),
+        });
+        found.add(post);
+      } else {
+        // Fallback: try to find a reasonable ancestor that looks like a card
+        // but NOT a UI element (composer, nav, etc.)
+        const card = walkUpTo(parentEl, (el) => {
+          // Skip if it has input elements (composer UI)
+          if (el.querySelector('input, textarea, [contenteditable="true"]'))
+            return false;
+          // Look for a substantial div with limited children
+          if (el.tagName !== "DIV" && el.tagName !== "SECTION") return false;
+          const rect = el.getBoundingClientRect();
+          return rect.height > 100 && el.children.length >= 2 && el.children.length <= 30;
+        }, 15);
+
+        if (card) {
+          console.log("[AdHighlighter] LinkedIn: promoted card (fallback)", {
+            tag: card.tagName,
+            class: card.className,
+          });
+          found.add(card);
+        } else {
+          console.log("[AdHighlighter] LinkedIn: 'Promoted' found but no suitable container");
+        }
+      }
+    }
+
+    // Also check for sidebar ad units with explicit ad markers
+    document
+      .querySelectorAll('[data-ad-banner], [data-test-id*="ad"], .ad-banner-container')
+      .forEach((el) => {
+        console.log("[AdHighlighter] LinkedIn: sidebar ad banner", {
+          tag: el.tagName,
+          class: el.className,
+        });
+        found.add(el);
+      });
+  }
+
+  function detectTwitterAds(found) {
+    // "Ad" label in tweet metadata (near the timestamp/username)
+    document.querySelectorAll("span").forEach((span) => {
+      if (span.textContent.trim().toLowerCase() === "ad") {
+        console.log("[AdHighlighter] Twitter: found 'Ad' span", {
+          class: span.className,
+          parentTag: span.parentElement?.tagName,
+          parentClass: span.parentElement?.className,
+        });
+        const article = walkUpTo(span, (el) => el.tagName === "ARTICLE");
+        if (article) {
+          console.log("[AdHighlighter] Twitter: flagging ad tweet");
+          found.add(article);
+        } else {
+          console.log(
+            "[AdHighlighter] Twitter: 'Ad' span found but no article ancestor, skipping",
+          );
+        }
+      }
+    });
+  }
+
+  function detectRedditAds(found) {
+    // shreddit-ad-post custom elements
+    document.querySelectorAll("shreddit-ad-post").forEach((el) => {
+      console.log("[AdHighlighter] Reddit: found shreddit-ad-post");
+      found.add(el);
+    });
+
+    // Posts with "promoted" flair
+    document.querySelectorAll("span").forEach((span) => {
+      if (span.textContent.trim().toLowerCase() === "promoted") {
+        const container = findAdContainer(span);
+        if (container) {
+          console.log("[AdHighlighter] Reddit: promoted post", {
+            containerTag: container.tagName,
+            containerClass: container.className,
+          });
+          found.add(container);
+        }
+      }
+    });
+  }
+
+  // Booking.com: no third-party ads — all content is first-party.
+  // This detector exists solely to claim the domain so the generic fallback is skipped.
+  function detectBookingAds(_found) {
+    console.log("[AdHighlighter] Booking.com: skipping — no third-party ads");
+  }
+
+  // ---- Always-on: ad-serving iframes ----
+
+  function detectAdIframes(found) {
+    document.querySelectorAll("iframe").forEach((iframe) => {
       try {
-        const src = (iframe.src || iframe.dataset.src || "").toLowerCase();
-        if (AD_IFRAME_DOMAINS.some((domain) => src.includes(domain))) {
-          // Highlight the iframe's parent container, not just the iframe
+        const src = (iframe.src || iframe.dataset?.src || "").toLowerCase();
+        if (AD_IFRAME_DOMAINS.some((d) => src.includes(d))) {
           const container = findAdContainer(iframe);
+          console.log("[AdHighlighter] Ad iframe detected:", {
+            src: src.slice(0, 100),
+            container: container
+              ? { tag: container.tagName, class: container.className }
+              : null,
+          });
           found.add(container || iframe);
         }
       } catch (e) {
@@ -327,129 +720,142 @@
     });
   }
 
-  // --- Strategy D: ARIA labels ---
-  function detectByAriaLabels(found) {
-    const withAria = document.querySelectorAll("[aria-label]");
-    withAria.forEach((el) => {
-      const label = el.getAttribute("aria-label").toLowerCase().trim();
-      if (
-        AD_ARIA_PATTERNS.some((p) => label === p || label.startsWith(p + " "))
-      ) {
-        const container = findAdContainer(el);
-        found.add(container || el);
-      }
-    });
+  // ---- Generic fallback: Island analysis ----
 
-    // Also check role="complementary" with ad-like content
-    const withRole = document.querySelectorAll(
-      '[role="complementary"], [role="banner"]',
+  function detectByIslandAnalysis(found) {
+    const viewportArea = window.innerWidth * window.innerHeight;
+    if (viewportArea === 0) return;
+
+    const candidates = document.querySelectorAll(
+      "div, article, section, aside, ins",
     );
-    withRole.forEach((el) => {
-      const text = el.textContent.toLowerCase();
-      if (AD_KEYWORDS.some((kw) => text.includes(kw))) {
+    let checked = 0;
+
+    for (const el of candidates) {
+      if (EXCLUDED_TAGS.has(el.tagName)) continue;
+
+      // Skip footer elements and anything nested inside a <footer>
+      if (el.tagName === "FOOTER" || el.closest("footer")) continue;
+
+      // Quick size filter: between 5% and 35% of viewport
+      const rect = el.getBoundingClientRect();
+      const area = rect.width * rect.height;
+      if (area < viewportArea * 0.05 || area > viewportArea * 0.35) continue;
+      if (rect.width < 100 || rect.height < 50) continue;
+
+      checked++;
+      if (checked > 200) break; // Safety limit
+
+      let score = 0;
+      const reasons = [];
+
+      // (1) External links — 3 points if >70% go to a different domain
+      const links = el.querySelectorAll("a[href]");
+      if (links.length > 0) {
+        let externalCount = 0;
+        for (const a of links) {
+          try {
+            const url = new URL(a.href);
+            if (url.hostname !== domain) externalCount++;
+          } catch {}
+        }
+        if (externalCount / links.length > 0.7) {
+          score += 3;
+          reasons.push(`external links ${externalCount}/${links.length}`);
+        }
+      }
+
+      // (2) Visual distinction — 2 points if different bg, border, or shadow
+      const style = window.getComputedStyle(el);
+      const parentEl = el.parentElement;
+      if (parentEl) {
+        const parentStyle = window.getComputedStyle(parentEl);
+        const hasBorder =
+          style.borderStyle !== "none" && parseFloat(style.borderWidth) > 0;
+        const hasShadow = style.boxShadow !== "none";
+        const differentBg =
+          style.backgroundColor !== parentStyle.backgroundColor &&
+          style.backgroundColor !== "rgba(0, 0, 0, 0)" &&
+          style.backgroundColor !== "transparent";
+        if (hasBorder || hasShadow || differentBg) {
+          score += 2;
+          reasons.push("visually distinct");
+        }
+      }
+
+      // (3) Soft keyword — 1 point
+      const textContent = el.textContent.toLowerCase();
+      if (SOFT_KEYWORDS.some((kw) => textContent.includes(kw))) {
+        score += 1;
+        reasons.push("soft keyword");
+      }
+
+      // Skip elements containing security/safety messaging (not ads)
+      if (
+        textContent.includes("stay safe") ||
+        textContent.includes("protect your security") ||
+        textContent.includes("privacy notice")
+      ) {
+        continue;
+      }
+
+      // (4) Iframe present — 2 points
+      if (el.querySelector("iframe")) {
+        score += 2;
+        reasons.push("has iframe");
+      }
+
+      // (5) Tracking params in image URLs — 1 point
+      const trackingParams = [
+        "utm_",
+        "click_id",
+        "tracking",
+        "impression",
+        "ad_id",
+        "campaign_id",
+      ];
+      const hasTracking = [...el.querySelectorAll("img")].some((img) =>
+        trackingParams.some((p) => (img.src || "").includes(p)),
+      );
+      if (hasTracking) {
+        score += 1;
+        reasons.push("tracking params");
+      }
+
+      // (6) Ad-related class/ID pattern — 3 points
+      if (elementMatchesAnyAdPattern(el)) {
+        score += 3;
+        reasons.push("ad class/id pattern");
+      }
+
+      if (score >= 6) {
+        console.log(`[AdHighlighter] Island detected (score ${score}):`, {
+          tag: el.tagName,
+          class: el.className,
+          id: el.id,
+          size: `${Math.round(rect.width)}x${Math.round(rect.height)}`,
+          reasons,
+        });
         found.add(el);
       }
-    });
-  }
-
-  // --- Strategy E: Structural patterns ---
-  function detectByStructure(found) {
-    // Google Search ads have specific structure
-    if (domain.includes("google.")) {
-      // Google search ads are marked with "Sponsored" text in specific spans
-      document.querySelectorAll("span").forEach((span) => {
-        const spanText = span.textContent.trim().toLowerCase();
-        if (spanText.includes("sponsored")) {
-          console.log("[AdHighlighter] Google span with 'sponsored':", {
-            fullText: spanText.slice(0, 120),
-            exactMatch: spanText === "sponsored",
-            tag: span.tagName,
-            class: span.className,
-            parentTag: span.parentElement?.tagName,
-            parentClass: span.parentElement?.className,
-          });
-        }
-        if (spanText === "sponsored") {
-          // Walk up to the containing search result
-          let el = span;
-          for (let i = 0; i < 10; i++) {
-            if (
-              !el.parentElement ||
-              EXCLUDED_TAGS.has(el.parentElement.tagName)
-            )
-              break;
-            el = el.parentElement;
-            // Google wraps each ad result in a div with data attributes
-            if (
-              el.getAttribute("data-text-ad") !== null ||
-              el.getAttribute("data-hveid") !== null
-            ) {
-              found.add(el);
-              break;
-            }
-          }
-          // If we didn't find a specific marker, use the general container finder
-          if (!found.has(el)) {
-            const container = findAdContainer(span);
-            if (container) found.add(container);
-          }
-        }
-      });
     }
 
-    // Facebook/Instagram sponsored posts
-    if (domain.includes("facebook.com") || domain.includes("instagram.com")) {
-      document
-        .querySelectorAll('a[href*="about/ads"], a[href*="/ads/about"]')
-        .forEach((link) => {
-          const container = findAdContainer(link);
-          if (container) found.add(container);
-        });
-    }
-
-    // Generic: elements that look like ad placeholders (fixed common sizes)
-    const commonAdSizes = [
-      [728, 90], // Leaderboard
-      [300, 250], // Medium Rectangle
-      [160, 600], // Wide Skyscraper
-      [320, 50], // Mobile Banner
-      [970, 250], // Billboard
-    ];
-
-    document.querySelectorAll("ins, div, aside").forEach((el) => {
-      const rect = el.getBoundingClientRect();
-      const w = Math.round(rect.width);
-      const h = Math.round(rect.height);
-      for (const [aw, ah] of commonAdSizes) {
-        if (Math.abs(w - aw) < 5 && Math.abs(h - ah) < 5) {
-          // Check if it also has ad-like signals (don't flag random divs)
-          const classes = (el.className || "").toLowerCase();
-          const id = (el.id || "").toLowerCase();
-          if (
-            containsAdSegment(classes, "ad") ||
-            containsAdSegment(id, "ad") ||
-            el.tagName === "INS"
-          ) {
-            found.add(el);
-          }
-          break;
-        }
-      }
-    });
+    console.log(
+      "[AdHighlighter] Island analysis: checked",
+      checked,
+      "candidates",
+    );
   }
 
   // ----------------------------------------------------------
   // 4. CONTAINER FINDING
   // ----------------------------------------------------------
 
-  // Walk up the DOM from a detected element to find the best
-  // "ad container" — the visual box the ad lives in.
   function findAdContainer(startElement) {
     if (!startElement) return null;
 
     let el = startElement;
     let best = startElement;
-    const startRect = startElement.getBoundingClientRect();
     const viewportArea = window.innerWidth * window.innerHeight;
 
     console.log("[AdHighlighter] findAdContainer start:", {
@@ -461,59 +867,74 @@
     for (let i = 0; i < 15; i++) {
       const parent = el.parentElement;
       if (!parent || EXCLUDED_TAGS.has(parent.tagName)) {
-        console.log(`[AdHighlighter]   step ${i}: STOP — ${!parent ? "no parent" : "excluded tag " + parent.tagName}`);
+        console.log(
+          `[AdHighlighter]   step ${i}: STOP — ${!parent ? "no parent" : "excluded tag " + parent.tagName}`,
+        );
         break;
       }
 
       const parentRect = parent.getBoundingClientRect();
       const parentArea = parentRect.width * parentRect.height;
 
-      // Stop if the parent is too large (>40% of viewport)
       if (parentArea > viewportArea * 0.4) {
-        console.log(`[AdHighlighter]   step ${i}: STOP — parent too large (${Math.round(parentArea / viewportArea * 100)}% of viewport)`, {
-          tag: parent.tagName, class: parent.className,
-        });
+        console.log(
+          `[AdHighlighter]   step ${i}: STOP — parent too large (${Math.round((parentArea / viewportArea) * 100)}% of viewport)`,
+          { tag: parent.tagName, class: parent.className },
+        );
         break;
       }
 
-      // Stop if parent is a major layout container with many children
       if (parent.children.length > 20) {
-        console.log(`[AdHighlighter]   step ${i}: STOP — too many children (${parent.children.length})`, {
-          tag: parent.tagName, class: parent.className,
-        });
+        console.log(
+          `[AdHighlighter]   step ${i}: STOP — too many children (${parent.children.length})`,
+          { tag: parent.tagName, class: parent.className },
+        );
         break;
       }
 
-      // Prefer to stop at natural container boundaries
       if (CONTAINER_TAGS.has(parent.tagName)) {
-        console.log(`[AdHighlighter]   step ${i}: container boundary, updating best`, {
-          tag: parent.tagName, class: parent.className,
-        });
+        console.log(
+          `[AdHighlighter]   step ${i}: container boundary, updating best`,
+          { tag: parent.tagName, class: parent.className },
+        );
         best = parent;
-        // Keep going one more level to check if there's a tighter wrapper
         el = parent;
         continue;
       }
 
-      // If parent has ad-related class, that's our container
       if (elementMatchesAnyAdPattern(parent)) {
-        console.log(`[AdHighlighter]   step ${i}: MATCH — ad-related class/id`, {
-          tag: parent.tagName, class: parent.className, id: parent.id,
-        });
+        console.log(
+          `[AdHighlighter]   step ${i}: MATCH — ad-related class/id`,
+          { tag: parent.tagName, class: parent.className, id: parent.id },
+        );
         return parent;
       }
 
       console.log(`[AdHighlighter]   step ${i}: walking up`, {
-        tag: parent.tagName, class: parent.className,
+        tag: parent.tagName,
+        class: parent.className,
       });
       best = parent;
       el = parent;
     }
 
     console.log("[AdHighlighter]   => returning best:", {
-      tag: best.tagName, class: best.className, id: best.id,
+      tag: best.tagName,
+      class: best.className,
+      id: best.id,
     });
     return best;
+  }
+
+  // Walk up the DOM from startEl until predicate(el) returns true
+  function walkUpTo(startEl, predicate, maxSteps = 15) {
+    let el = startEl;
+    for (let i = 0; i < maxSteps; i++) {
+      el = el.parentElement;
+      if (!el || EXCLUDED_TAGS.has(el.tagName)) return null;
+      if (predicate(el)) return el;
+    }
+    return null;
   }
 
   // ----------------------------------------------------------
@@ -523,18 +944,16 @@
   function highlightElement(el) {
     el.classList.add("adh-v2-highlighted");
 
-    // Create dismiss button
     const btn = document.createElement("button");
     btn.className = "adh-v2-dismiss-btn";
-    btn.textContent = "✕ Not an ad";
-    btn.title = "Dismiss — this is not an ad";
+    btn.textContent = "\u2715 Not an ad";
+    btn.title = "Dismiss \u2014 this is not an ad";
     btn.addEventListener("click", (e) => {
       e.stopPropagation();
       e.preventDefault();
       dismissElement(el);
     });
 
-    // Ensure the element is positioned for the button
     const position = window.getComputedStyle(el).position;
     if (position === "static") {
       el.style.position = "relative";
@@ -552,7 +971,6 @@
     }
     highlightedElements.delete(el);
 
-    // Save dismissal for this domain
     const selector = generateSelector(el);
     if (selector) {
       dismissedSelectors.add(selector);
@@ -570,7 +988,6 @@
   }
 
   function generateSelector(el) {
-    // Generate a reasonably stable CSS selector for an element
     if (el.id) return `#${CSS.escape(el.id)}`;
 
     const parts = [];
@@ -636,7 +1053,6 @@
     }
 
     if (shouldRescan) {
-      // Debounce rescans
       clearTimeout(observer._timeout);
       observer._timeout = setTimeout(() => scanPage(), 500);
     }
@@ -655,17 +1071,6 @@
     return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   }
 
-  // Check if we're on a Google search results page
-  function isGoogleSearchPage() {
-    return (
-      domain.includes("google.") &&
-      window.location.pathname.startsWith("/search")
-    );
-  }
-
-  // Check if `pattern` appears in `str` as a distinct segment, bounded by
-  // start/end of string, whitespace, hyphens, or underscores.
-  // e.g. "ad-container" matches in "xyz-ad-container" but not "broad-container"
   function containsAdSegment(str, pattern) {
     const regex = new RegExp(
       `(^|[\\s\\-_])${escapeRegex(pattern)}([\\s\\-_]|$)`,
@@ -674,7 +1079,6 @@
     return regex.test(str);
   }
 
-  // Check if an element's classes or ID match any AD_CLASS_PATTERN
   function elementMatchesAnyAdPattern(el) {
     const classes = (
       typeof el.className === "string" ? el.className : ""
