@@ -306,45 +306,140 @@
     }
   }
 
-  function detectYouTubeAds(found) {
-    // Ad slot renderers in feed/sidebar
+  // ---- YouTube: overlay approach ----
+  // YouTube's stacking contexts hide CSS-based highlights behind thumbnails.
+  // We create position:absolute overlays on document.body instead.
+  const ytOverlaid = new WeakSet();
+
+  function ytCreateOverlay(el) {
+    if (ytOverlaid.has(el)) return;
+    ytOverlaid.add(el);
+
+    const rect = el.getBoundingClientRect();
+    if (rect.width === 0 || rect.height === 0) return;
+
+    const overlay = document.createElement("div");
+    overlay.className = "adh-v2-yt-overlay";
+    overlay.style.cssText = [
+      "position: absolute",
+      "top: " + Math.round(rect.top + window.scrollY) + "px",
+      "left: " + Math.round(rect.left + window.scrollX) + "px",
+      "width: " + Math.round(rect.width) + "px",
+      "height: " + Math.round(rect.height) + "px",
+      "border: 4px solid #ff2d2d",
+      "background: rgba(255, 45, 45, 0.1)",
+      "pointer-events: none",
+      "z-index: 2147483647",
+      "border-radius: 8px",
+      "box-sizing: border-box",
+    ].join(" !important;") + " !important";
+
+    const badge = document.createElement("div");
+    badge.textContent = "\u26A0 AD DETECTED";
+    badge.style.cssText = [
+      "position: absolute",
+      "bottom: -28px",
+      "left: 0",
+      "background: #ff2d2d",
+      "color: white",
+      "font-size: 12px",
+      "font-weight: 700",
+      "padding: 4px 10px",
+      "border-radius: 4px",
+      "pointer-events: none",
+      "font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif",
+      "letter-spacing: 0.3px",
+      "line-height: 16px",
+    ].join(" !important;") + " !important";
+    overlay.appendChild(badge);
+
+    document.body.appendChild(overlay);
+    highlightedElements.set(overlay, { btn: null, isYtOverlay: true, sourceEl: el });
+
+    console.log("[AdHighlighter] YouTube: created overlay", {
+      top: Math.round(rect.top + window.scrollY),
+      width: Math.round(rect.width),
+      height: Math.round(rect.height),
+    });
+  }
+
+  function detectYouTubeAds(_found) {
+    // Helper: find the ad card container for an element
+    function ytFindAdContainer(el) {
+      const container = el.closest(
+        "ytd-promoted-video-renderer, ytd-video-renderer, ytd-ad-slot-renderer, ytd-in-feed-ad-layout-renderer",
+      );
+      if (container) return container;
+      return walkUpTo(el, (ancestor) => {
+        return ancestor.getBoundingClientRect().width > 400;
+      }, 15);
+    }
+
+    // Collect all ad elements, then create overlays
+    const adElements = new Set();
+
+    // 1. Known ad custom elements
     const adSelectors = [
       "ytd-ad-slot-renderer",
       "ytd-promoted-sparkles-web-renderer",
       "ytd-display-ad-renderer",
       "ytd-promoted-video-renderer",
+      "ytd-in-feed-ad-layout-renderer",
     ];
     for (const sel of adSelectors) {
       document.querySelectorAll(sel).forEach((el) => {
         console.log("[AdHighlighter] YouTube: found " + sel);
-        found.add(el);
+        adElements.add(el);
       });
     }
 
-    // "Sponsored" badges in feed
-    document.querySelectorAll("span").forEach((span) => {
-      if (span.textContent.trim().toLowerCase() === "sponsored") {
-        const container = findAdContainer(span);
-        if (container) {
-          console.log("[AdHighlighter] YouTube: 'Sponsored' badge", {
-            containerTag: container.tagName,
-            containerClass: container.className,
-          });
-          found.add(container);
-        }
-      }
-    });
+    // 2. Ad-related custom elements and classes
+    document
+      .querySelectorAll("ad-button-hover-overlay-view-model, [class*='ytwAd']")
+      .forEach((el) => {
+        console.log("[AdHighlighter] YouTube: found ad element", el.tagName, (typeof el.className === "string" ? el.className : "").substring(0, 80));
+        const container = ytFindAdContainer(el);
+        adElements.add(container || el);
+      });
 
-    // Video player ads
+    // 3. TreeWalker: find "Sponsored" text nodes
+    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+    let textNode;
+    while ((textNode = walker.nextNode())) {
+      const text = textNode.textContent.trim();
+      if (text !== "Sponsored" && !/^Sponsored\s*[·•\u00B7\u2022\u2027]/.test(text)) continue;
+
+      const parentEl = textNode.parentElement;
+      if (!parentEl) continue;
+
+      console.log("[AdHighlighter] YouTube: found 'Sponsored' text", {
+        text: text.substring(0, 60),
+        parentTag: parentEl.tagName,
+      });
+
+      const container = ytFindAdContainer(parentEl);
+      if (container) adElements.add(container);
+    }
+
+    // 4. Video player ads
     const adModule = document.querySelector(".ytp-ad-module");
     if (adModule && adModule.children.length > 0) {
       console.log("[AdHighlighter] YouTube: video ad module active");
-      found.add(adModule);
+      adElements.add(adModule);
     }
     const adShowing = document.querySelector(".ad-showing");
     if (adShowing) {
       console.log("[AdHighlighter] YouTube: player in ad-showing state");
-      found.add(adShowing);
+      adElements.add(adShowing);
+    }
+
+    // Deduplicate and create overlays (not CSS highlights)
+    const unique = [...adElements].filter((el) => {
+      return ![...adElements].some((other) => other !== el && other.contains(el));
+    });
+
+    for (const el of unique) {
+      ytCreateOverlay(el);
     }
   }
 
@@ -854,6 +949,12 @@
 
   function dismissElement(el) {
     const data = highlightedElements.get(el);
+    if (data && data.isYtOverlay) {
+      el.remove();
+      highlightedElements.delete(el);
+      updateBadge();
+      return;
+    }
     el.classList.remove("adh-v2-highlighted");
     if (data && data.btn && data.btn.parentElement) {
       data.btn.remove();
@@ -906,9 +1007,13 @@
 
   function clearAllHighlights() {
     highlightedElements.forEach((data, el) => {
-      el.classList.remove("adh-v2-highlighted");
-      if (data.btn && data.btn.parentElement) {
-        data.btn.remove();
+      if (data.isYtOverlay) {
+        el.remove();
+      } else {
+        el.classList.remove("adh-v2-highlighted");
+        if (data.btn && data.btn.parentElement) {
+          data.btn.remove();
+        }
       }
     });
     highlightedElements.clear();
