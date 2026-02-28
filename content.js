@@ -456,7 +456,8 @@
 
     let textNode;
     while ((textNode = walker.nextNode())) {
-      if (textNode.textContent.trim().toLowerCase() !== "promoted") continue;
+      const trimmedText = textNode.textContent.trim();
+      if (!trimmedText.toLowerCase().startsWith("promoted") || trimmedText.length >= 60) continue;
 
       const parentEl = textNode.parentElement;
       if (!parentEl) continue;
@@ -944,6 +945,17 @@
     childList: true,
     subtree: true,
   });
+
+  // LinkedIn: rescan on scroll to catch lazy-loaded feed posts
+  if (/(?:^|\.)linkedin\.com$/.test(domain)) {
+    let lastScrollScan = 0;
+    window.addEventListener("scroll", () => {
+      if (Date.now() - lastScrollScan > 2000) {
+        lastScrollScan = Date.now();
+        scanPage();
+      }
+    });
+  }
 
   // ----------------------------------------------------------
   // UTILITY
