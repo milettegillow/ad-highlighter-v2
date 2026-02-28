@@ -199,10 +199,17 @@
   // ---- Site-specific detectors ----
 
   function detectGoogleAds(found) {
+    // Skip empty ad placeholders: must be tall enough and have text content
+    function isRealAdBlock(el) {
+      if (el.getBoundingClientRect().height < 100) return false;
+      if (el.textContent.trim().length < 20) return false;
+      return true;
+    }
+
     // 1. Traditional wrapper IDs — highlight directly (these contain ad blocks)
     for (const id of ["tads", "bottomads"]) {
       const container = document.getElementById(id);
-      if (container) {
+      if (container && isRealAdBlock(container)) {
         console.log("[AdHighlighter] Google: found #" + id, {
           childCount: container.children.length,
         });
@@ -213,7 +220,7 @@
     // 2. Elements with data-text-ad attribute — highlight the element DIRECTLY
     //    (do NOT use findAdContainer which walks to wrong parent)
     document.querySelectorAll("[data-text-ad]").forEach((el) => {
-      if (!found.has(el)) {
+      if (!found.has(el) && isRealAdBlock(el)) {
         console.log("[AdHighlighter] Google: found [data-text-ad]", {
           tag: el.tagName,
           class: el.className,
@@ -282,7 +289,7 @@
           10,
         );
 
-        if (section) {
+        if (section && isRealAdBlock(section)) {
           console.log("[AdHighlighter] Google: flagging Sponsored section", {
             tag: section.tagName,
             class: section.className,
