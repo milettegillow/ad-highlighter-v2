@@ -484,8 +484,35 @@
     metaBadgeSponsoredLabels("Facebook", ["Sponsored", "Ad"]);
   }
 
-  function detectInstagramAds(_found) {
-    metaBadgeSponsoredLabels("Instagram", ["Sponsored"]);
+  // ---- Instagram: find "Ad" spans, walk up to <article>, highlight ----
+  function detectInstagramAds(found) {
+    const spans = document.querySelectorAll("span");
+
+    for (const span of spans) {
+      const text = span.textContent.trim();
+      if (text !== "Ad" || text.length !== 2) continue;
+
+      // Dedup: check if a badge already exists nearby
+      const next = span.nextElementSibling;
+      const parentNext = span.parentElement?.nextElementSibling;
+      if ((next && next.textContent.includes("\u26A0")) || (parentNext && parentNext.textContent.includes("\u26A0"))) continue;
+
+      const article = span.closest("article");
+      console.log("[AdHighlighter] Instagram: found Ad span", span, "article:", article);
+
+      if (article) {
+        if (!article.classList.contains("adh-v2-highlighted")) {
+          found.add(article);
+        }
+      } else {
+        span.style.cssText += "color: #ff2d2d !important; font-weight: 700 !important;";
+
+        const badge = document.createElement("span");
+        badge.textContent = " \u26A0 AD";
+        badge.style.cssText = "background:#ff2d2d;color:white;font-size:11px;font-weight:700;padding:2px 6px;border-radius:3px;margin-left:6px;z-index:9999;";
+        span.insertAdjacentElement("afterend", badge);
+      }
+    }
   }
 
   function detectAmazonAds(found) {
@@ -1032,8 +1059,10 @@
 
     if (shouldRescan) {
       clearTimeout(observer._timeout);
-      const isMeta = /(?:^|\.)facebook\.com$/.test(domain) || /(?:^|\.)instagram\.com$/.test(domain);
-      observer._timeout = setTimeout(() => scanPage(), isMeta ? 3000 : 500);
+      const isFacebook = /(?:^|\.)facebook\.com$/.test(domain);
+      const isInstagram = /(?:^|\.)instagram\.com$/.test(domain);
+      const throttle = isFacebook ? 3000 : isInstagram ? 1000 : 500;
+      observer._timeout = setTimeout(() => scanPage(), throttle);
     }
   });
 
@@ -1047,6 +1076,17 @@
     let lastScrollScan = 0;
     window.addEventListener("scroll", () => {
       if (Date.now() - lastScrollScan > 2000) {
+        lastScrollScan = Date.now();
+        scanPage();
+      }
+    });
+  }
+
+  // Instagram: rescan on scroll — DOM elements are recycled on scroll
+  if (/(?:^|\.)instagram\.com$/.test(domain)) {
+    let lastScrollScan = 0;
+    window.addEventListener("scroll", () => {
+      if (Date.now() - lastScrollScan > 1500) {
         lastScrollScan = Date.now();
         scanPage();
       }
