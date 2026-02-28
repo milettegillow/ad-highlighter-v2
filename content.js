@@ -593,36 +593,32 @@
     });
   }
 
-  // ---- LinkedIn: overlay approach ----
-  // LinkedIn's stacking contexts can hide CSS-based highlights.
-  // We create position:absolute overlays on document.body instead.
+  // ---- LinkedIn: inline overlay approach ----
+  // Uses position:relative on container + position:absolute inset:0 child
+  // with outline (not border) so it doesn't shift layout.
 
-  function linkedinCreateOverlay(el, label) {
-    const rect = el.getBoundingClientRect();
-    if (rect.width === 0 || rect.height === 0) return;
+  function linkedinCreateOverlay(container, label) {
+    if (container.getAttribute("data-ad-highlighted")) return;
+    if (container.offsetWidth === 0 || container.offsetHeight === 0) return;
 
-    const top = Math.round(rect.top + window.scrollY);
-    const left = Math.round(rect.left + window.scrollX);
+    container.setAttribute("data-ad-highlighted", "true");
 
-    // Dedup: skip if an overlay already exists within 50px of this position
-    for (const [, data] of highlightedElements) {
-      if (data.isLinkedInOverlay && Math.abs(data.overlayTop - top) < 50 && Math.abs(data.overlayLeft - left) < 50) {
-        return;
-      }
+    // Make container the positioning anchor
+    const pos = getComputedStyle(container).position;
+    if (pos === "static") {
+      container.style.position = "relative";
     }
 
     const overlay = document.createElement("div");
     overlay.className = "adh-v2-linkedin-overlay";
     overlay.style.cssText = [
       "position: absolute",
-      "top: " + top + "px",
-      "left: " + left + "px",
-      "width: " + Math.round(rect.width) + "px",
-      "height: " + Math.round(rect.height) + "px",
-      "border: 4px solid #ff2d2d",
-      "background: rgba(255, 45, 45, 0.08)",
+      "inset: 0",
+      "outline: 3px solid #ff2d2d",
+      "outline-offset: -3px",
+      "background: rgba(255, 45, 45, 0.06)",
       "pointer-events: none",
-      "z-index: 2147483647",
+      "z-index: 999",
       "border-radius: 8px",
       "box-sizing: border-box",
     ].join(" !important;") + " !important";
@@ -631,18 +627,18 @@
     badge.textContent = "\u26A0 AD DETECTED";
     badge.style.cssText = [
       "position: absolute",
-      "bottom: -28px",
-      "left: 0",
+      "top: 4px",
+      "left: 4px",
       "background: #ff2d2d",
       "color: white",
-      "font-size: 12px",
+      "font-size: 11px",
       "font-weight: 700",
-      "padding: 4px 10px",
+      "padding: 3px 8px",
       "border-radius: 4px",
       "pointer-events: none",
       "font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif",
       "letter-spacing: 0.3px",
-      "line-height: 16px",
+      "line-height: 14px",
     ].join(" !important;") + " !important";
     overlay.appendChild(badge);
 
@@ -658,46 +654,20 @@
     });
     overlay.appendChild(btn);
 
-    document.body.appendChild(overlay);
-    highlightedElements.set(overlay, { btn, isLinkedInOverlay: true, sourceEl: el, overlayTop: top, overlayLeft: left });
+    container.appendChild(overlay);
+    highlightedElements.set(overlay, { btn, isLinkedInOverlay: true, sourceEl: container });
 
-    console.log("[AdHighlighter] LinkedIn: created overlay for " + label, {
-      top,
-      width: Math.round(rect.width),
-      height: Math.round(rect.height),
+    console.log("[AdHighlighter] LinkedIn: highlighted " + label, {
+      tag: container.tagName,
+      w: container.offsetWidth,
+      h: container.offsetHeight,
     });
   }
 
   function detectLinkedInAds(_found) {
-    // Walk up to find the feed post container
-    function findFeedPostContainer(el) {
-      let current = el;
-      for (let i = 0; i < 12; i++) {
-        current = current.parentElement;
-        if (!current || current === document.body) break;
-        if (current.tagName === "MAIN" || current.getAttribute("role") === "main") break;
+    if (!isContextValid()) return;
 
-        // Skip composer UI
-        if (current.querySelector('input, textarea, [contenteditable="true"]')) continue;
-
-        const hasDataUrn = current.getAttribute("data-urn") !== null;
-        const hasDataId = current.getAttribute("data-id") !== null && current.tagName === "DIV";
-        const cls = (typeof current.className === "string" ? current.className : "").toLowerCase();
-        const isFeedUpdate = cls.includes("feed-shared-update") || cls.includes("occludable-update");
-
-        if (hasDataUrn || hasDataId || isFeedUpdate) {
-          // Validate: should not contain more than one Like button (multiple = too high)
-          const likeButtons = current.querySelectorAll('button[aria-label*="Like"], button[aria-label*="like"]');
-          if (likeButtons.length > 1) continue;
-          return current;
-        }
-      }
-      return null;
-    }
-
-    const adElements = new Set();
-
-    // --- Feed: "Promoted by" text ---
+    // --- Feed: "Promoted" text via TreeWalker (restored from working version) ---
     const walker = document.createTreeWalker(
       document.body,
       NodeFilter.SHOW_TEXT,
@@ -712,92 +682,72 @@
       const parentEl = textNode.parentElement;
       if (!parentEl) continue;
 
-      // Skip sidebar — handle separately below
-      if (parentEl.closest("aside") || parentEl.closest('[role="complementary"]')) continue;
-      if (parentEl.closest('[data-testid="promoted-badge"]')) continue;
-
-      // Verify this is "Promoted by ..." — not just "Promoted" alone
-      let isPromotedBy = false;
-      if (/^promoted\s+by\s/i.test(trimmedText)) {
-        isPromotedBy = true;
-      } else if (trimmedText.toLowerCase() === "promoted") {
-        // Check if "by" follows in parent/grandparent text
-        const parent = textNode.parentElement;
-        if (parent) {
-          const fullText = parent.textContent.trim().toLowerCase();
-          if (fullText.startsWith("promoted") && fullText.includes(" by ")) {
-            isPromotedBy = true;
-          }
-          if (!isPromotedBy && parent.parentElement) {
-            const grandText = parent.parentElement.textContent.trim().toLowerCase();
-            if (/^promoted\b/.test(grandText) && grandText.includes(" by ")) {
-              isPromotedBy = true;
-            }
-          }
-        }
-      }
-
-      if (!isPromotedBy) continue;
-
-      console.log("[AdHighlighter] LinkedIn: found 'Promoted by' text", {
-        text: trimmedText.substring(0, 40),
-        parentTag: parentEl.tagName,
+      console.log("[AdHighlighter] LinkedIn: found 'Promoted' text node in <" + parentEl.tagName.toLowerCase() + ">", {
+        class: parentEl.className,
+        parentTag: parentEl.parentElement?.tagName,
+        parentClass: parentEl.parentElement?.className,
       });
 
-      const container = findFeedPostContainer(parentEl);
-      if (container && !container.getAttribute("data-ad-highlighted")) {
-        container.setAttribute("data-ad-highlighted", "true");
-        console.log("[AdHighlighter] LinkedIn: feed promoted post", {
-          tag: container.tagName,
-          dataUrn: container.getAttribute("data-urn"),
-          w: container.offsetWidth,
-          h: container.offsetHeight,
+      // Walk up to feed post container using walkUpTo (the approach that was working)
+      const post = walkUpTo(parentEl, (el) => {
+        if (el.getAttribute("data-urn") !== null) return true;
+        if (el.getAttribute("data-id") !== null && el.tagName === "DIV")
+          return true;
+        const cls = (
+          typeof el.className === "string" ? el.className : ""
+        ).toLowerCase();
+        if (cls.includes("feed-shared-update")) return true;
+        if (cls.includes("occludable-update")) return true;
+        return false;
+      }, 20);
+
+      if (post) {
+        console.log("[AdHighlighter] LinkedIn: promoted post container", {
+          tag: post.tagName,
+          class: post.className,
+          dataUrn: post.getAttribute("data-urn"),
+          dataId: post.getAttribute("data-id"),
         });
-        adElements.add(container);
+        linkedinCreateOverlay(post, "feed ad");
+      } else {
+        // Fallback: find a reasonable ancestor that looks like a card
+        const card = walkUpTo(parentEl, (el) => {
+          if (el.querySelector('input, textarea, [contenteditable="true"]'))
+            return false;
+          if (el.tagName !== "DIV" && el.tagName !== "SECTION") return false;
+          const rect = el.getBoundingClientRect();
+          return rect.height > 100 && el.children.length >= 2 && el.children.length <= 30;
+        }, 15);
+
+        if (card) {
+          console.log("[AdHighlighter] LinkedIn: promoted card (fallback)", {
+            tag: card.tagName,
+            class: card.className,
+          });
+          linkedinCreateOverlay(card, "feed ad");
+        } else {
+          console.log("[AdHighlighter] LinkedIn: 'Promoted' found but no suitable container");
+        }
       }
     }
 
-    // --- Sidebar: promoted company cards ---
+    // --- Sidebar: promoted company cards (NEW) ---
     // Signal 1: data-testid="promoted-badge"
     document.querySelectorAll('[data-testid="promoted-badge"]').forEach((badge) => {
       const container = badge.closest('[data-testid="follow-company-container"]') ||
                         badge.closest("#ads-container") ||
                         badge.closest("aside");
       if (container && !container.getAttribute("data-ad-highlighted")) {
-        container.setAttribute("data-ad-highlighted", "true");
-        console.log("[AdHighlighter] LinkedIn: sidebar promoted card", {
-          tag: container.tagName,
-          id: container.id,
-          w: container.offsetWidth,
-          h: container.offsetHeight,
-        });
-        adElements.add(container);
+        linkedinCreateOverlay(container, "sidebar ad");
       }
     });
 
     // Signal 2: direct container selectors
     document.querySelectorAll('#ads-container, [data-testid="follow-company-container"]').forEach((el) => {
       if (!el.getAttribute("data-ad-highlighted")) {
-        el.setAttribute("data-ad-highlighted", "true");
-        console.log("[AdHighlighter] LinkedIn: sidebar ad container", {
-          tag: el.tagName,
-          id: el.id,
-          testId: el.getAttribute("data-testid"),
-        });
-        adElements.add(el);
+        linkedinCreateOverlay(el, "sidebar ad");
       }
     });
-
-    // Deduplicate and create overlays
-    const unique = [...adElements].filter((el) => {
-      return ![...adElements].some((other) => other !== el && other.contains(el));
-    });
-
-    for (const el of unique) {
-      const inSidebar = el.closest("aside") || el.closest('[role="complementary"]') ||
-                        el.id === "ads-container" || el.getAttribute("data-testid") === "follow-company-container";
-      linkedinCreateOverlay(el, inSidebar ? "sidebar ad" : "feed ad");
-    }
   }
 
   // ---- Twitter/X: overlay approach ----
@@ -1212,6 +1162,10 @@
   function dismissElement(el) {
     const data = highlightedElements.get(el);
     if (data && (data.isYtOverlay || data.isTwitterOverlay || data.isLinkedInOverlay)) {
+      // For LinkedIn inline overlays, clean up the container's data attribute
+      if (data.isLinkedInOverlay && data.sourceEl) {
+        data.sourceEl.removeAttribute("data-ad-highlighted");
+      }
       el.remove();
       highlightedElements.delete(el);
       updateBadge();
@@ -1270,6 +1224,9 @@
   function clearAllHighlights() {
     highlightedElements.forEach((data, el) => {
       if (data.isYtOverlay || data.isTwitterOverlay || data.isLinkedInOverlay) {
+        if (data.isLinkedInOverlay && data.sourceEl) {
+          data.sourceEl.removeAttribute("data-ad-highlighted");
+        }
         el.remove();
       } else {
         el.classList.remove("adh-v2-highlighted");
@@ -1343,7 +1300,7 @@
     let lastScrollScan = 0;
     window.addEventListener("scroll", () => {
       if (!isContextValid()) return;
-      if (Date.now() - lastScrollScan > 2000) {
+      if (Date.now() - lastScrollScan > 500) {
         lastScrollScan = Date.now();
         scanPage();
       }
