@@ -163,9 +163,14 @@
       detectByIslandAnalysis(found);
     }
 
-    console.log("[AdHighlighter] Scan complete. Elements found:", found.size);
+    // Deduplicate: if element A contains element B, keep only the outermost A
+    const unique = [...found].filter((el) => {
+      return ![...found].some((other) => other !== el && other.contains(el));
+    });
 
-    found.forEach((el) => {
+    console.log("[AdHighlighter] Scan complete. Elements found:", found.size, "unique:", unique.length);
+
+    unique.forEach((el) => {
       if (!highlightedElements.has(el) && !isDismissed(el)) {
         highlightElement(el);
       }
@@ -336,163 +341,39 @@
     }
   }
 
-  function detectFacebookAds(found) {
-    // Use TreeWalker to scan ALL text nodes for ad labels.
-    // Facebook renders "Sponsored", "Ad", "Ad · 🌐", "Sponsored · 🌐" etc.
-    // in various nested span structures that querySelectorAll can miss.
-    const walker = document.createTreeWalker(
-      document.body,
-      NodeFilter.SHOW_TEXT,
-      null,
-    );
+  // ---- Facebook: inline badge approach ----
+  // Self-contained — does not touch the `found` set or shared state.
+  // Uses its own WeakSet to track badged elements across rescans.
+  const fbBadged = new WeakSet();
 
-    let textNode;
-    while ((textNode = walker.nextNode())) {
-      const raw = textNode.textContent.trim();
-      if (!raw) continue;
-      const lower = raw.toLowerCase();
+  function detectFacebookAds(_found) {
+    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+    let node;
 
-      // Match: "sponsored", "ad", or "ad" / "sponsored" followed by separator (· • etc)
-      const isSponsoredLabel = lower === "sponsored" || /^sponsored\s*[\u00B7\u2022\u2027·•]/.test(lower);
-      const isAdLabel = lower === "ad" || /^ad\s*[\u00B7\u2022\u2027·•]/.test(lower);
+    while ((node = walker.nextNode())) {
+      const text = node.textContent.trim();
+      if (text !== "Sponsored" && text !== "Ad") continue;
 
-      if (!isSponsoredLabel && !isAdLabel) continue;
+      const parent = node.parentElement;
+      if (!parent || fbBadged.has(parent)) continue;
 
-      const parentEl = textNode.parentElement;
-      if (!parentEl) continue;
+      // Skip hidden elements (rect at 0,0 with no height)
+      const rect = parent.getBoundingClientRect();
+      if (rect.height === 0 && rect.top === 0) continue;
+      if (rect.height === 0 || rect.top <= 0) continue;
 
-      // Skip if parent is too large (avoid matching page-level text)
-      if (parentEl.tagName === "BODY" || parentEl.tagName === "HTML") continue;
+      // Make the label bright red
+      parent.style.cssText += "color: #ff2d2d !important; font-weight: 700 !important;";
 
-      console.log(
-        "[AdHighlighter] Facebook: found '" + raw + "' text node in <" + parentEl.tagName.toLowerCase() + ">",
-        {
-          class: parentEl.className,
-          parentTag: parentEl.parentElement?.tagName,
-          parentClass: parentEl.parentElement?.className,
-        },
-      );
+      // Add badge
+      const badge = document.createElement("span");
+      badge.textContent = " \u26A0 AD";
+      badge.style.cssText = "background:#ff2d2d;color:white;font-size:11px;font-weight:700;padding:2px 6px;border-radius:3px;margin-left:6px;z-index:9999;";
+      parent.insertAdjacentElement("afterend", badge);
 
-      // --- Tier 1: walk up looking for role="article" (up to 20 levels) ---
-      const article = walkUpTo(
-        parentEl,
-        (ancestor) => ancestor.getAttribute("role") === "article",
-        20,
-      );
-      if (article) {
-        console.log("[AdHighlighter] Facebook: flagging feed ad post (role=article)");
-        found.add(article);
-        continue;
-      }
-
-      console.log("[AdHighlighter] Facebook: no role=article found, trying feed-width heuristic");
-
-      // --- Tier 2: walk up looking for a feed-post-sized container ---
-      // Facebook feed posts are consistently ~500-700px wide. Look for a
-      // container that is 400-800px wide AND contains text + an image or link.
-      let feedPost = null;
-      {
-        let el = parentEl;
-        for (let i = 0; i < 20; i++) {
-          el = el.parentElement;
-          if (!el || el.tagName === "BODY" || el.tagName === "HTML") break;
-          const rect = el.getBoundingClientRect();
-          const cls = typeof el.className === "string" ? el.className : "";
-          console.log(
-            "[AdHighlighter] Facebook walk step " + i + ":",
-            el.tagName,
-            cls.substring(0, 50),
-            el.getAttribute("role"),
-            Math.round(rect.width),
-          );
-          if (rect.width >= 400 && rect.width <= 800) {
-            const hasImage = el.querySelector("img");
-            const hasLink = el.querySelector("a[href]");
-            const hasText = el.textContent.trim().length > 50;
-            if (hasText && (hasImage || hasLink)) {
-              feedPost = el;
-              // Don't break — keep walking to find the outermost
-              // feed-width container (the actual post boundary)
-            }
-          }
-          // Stop if we've gone past feed width (too wide = page column)
-          if (rect.width > 900) break;
-        }
-      }
-      if (feedPost) {
-        console.log("[AdHighlighter] Facebook: flagging feed ad post (width heuristic)", {
-          tag: feedPost.tagName,
-          class: (typeof feedPost.className === "string" ? feedPost.className : "").substring(0, 80),
-          width: Math.round(feedPost.getBoundingClientRect().width),
-        });
-        found.add(feedPost);
-        continue;
-      }
-
-      console.log("[AdHighlighter] Facebook: width heuristic failed, using depth fallback");
-
-      // --- Tier 3: brute-force walk up 10 levels from the text node ---
-      // Better to highlight an imperfect container than nothing at all.
-      // For sidebar "Sponsored" headings, try to find individual cards first.
-      if (isSponsoredLabel) {
-        const section = walkUpTo(
-          parentEl,
-          (ancestor) => {
-            return (
-              ancestor.children.length >= 2 &&
-              ancestor.children.length <= 12
-            );
-          },
-          8,
-        );
-        if (section) {
-          let cardsFound = 0;
-          for (const child of section.children) {
-            if (!child.contains(parentEl) && child.querySelector("a[href]")) {
-              console.log("[AdHighlighter] Facebook: sidebar ad card", {
-                tag: child.tagName,
-                class: child.className,
-              });
-              found.add(child);
-              cardsFound++;
-            }
-          }
-          if (cardsFound > 0) continue;
-        }
-      }
-
-      // Last resort: walk up exactly 10 levels and use whatever we land on
-      {
-        let el = parentEl;
-        for (let i = 0; i < 10; i++) {
-          if (!el.parentElement || el.parentElement.tagName === "BODY" || el.parentElement.tagName === "HTML") break;
-          el = el.parentElement;
-        }
-        if (el !== parentEl) {
-          console.log("[AdHighlighter] Facebook: flagging via depth fallback (10 levels up)", {
-            tag: el.tagName,
-            class: (typeof el.className === "string" ? el.className : "").substring(0, 80),
-            width: Math.round(el.getBoundingClientRect().width),
-          });
-          found.add(el);
-        }
-      }
+      fbBadged.add(parent);
+      console.log("[AdHighlighter] Facebook: badged", text, "at", rect.top);
     }
-
-    // --- Links to ads about/transparency page ---
-    document
-      .querySelectorAll('a[href*="about/ads"], a[href*="/ads/about"]')
-      .forEach((link) => {
-        const article = walkUpTo(
-          link,
-          (ancestor) => ancestor.getAttribute("role") === "article",
-          20,
-        );
-        if (article && !found.has(article)) {
-          console.log("[AdHighlighter] Facebook: ad post via ads-about link");
-          found.add(article);
-        }
-      });
   }
 
   function detectInstagramAds(found) {
@@ -964,8 +845,8 @@
   }
 
   function dismissElement(el) {
-    el.classList.remove("adh-v2-highlighted");
     const data = highlightedElements.get(el);
+    el.classList.remove("adh-v2-highlighted");
     if (data && data.btn && data.btn.parentElement) {
       data.btn.remove();
     }
@@ -1054,7 +935,8 @@
 
     if (shouldRescan) {
       clearTimeout(observer._timeout);
-      observer._timeout = setTimeout(() => scanPage(), 500);
+      const isFacebook = /(?:^|\.)facebook\.com$/.test(domain);
+      observer._timeout = setTimeout(() => scanPage(), isFacebook ? 3000 : 500);
     }
   });
 
