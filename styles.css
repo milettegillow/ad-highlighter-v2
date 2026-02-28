@@ -1,0 +1,77 @@
+/* ============================================================
+   Ad Highlighter v2 — Injected Styles
+   ============================================================ */
+
+/* The main highlight overlay */
+.adh-v2-highlighted {
+  outline: 3px solid #ff2d2d !important;
+  outline-offset: 2px !important;
+  background-color: rgba(255, 45, 45, 0.06) !important;
+  border-radius: 4px !important;
+  transition: outline-color 0.2s ease, background-color 0.2s ease !important;
+  position: relative !important;
+}
+
+.adh-v2-highlighted::before {
+  content: "⚠ AD DETECTED";
+  position: absolute !important;
+  top: -22px !important;
+  left: 4px !important;
+  background: #ff2d2d !important;
+  color: white !important;
+  font-size: 10px !important;
+  font-weight: 700 !important;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif !important;
+  letter-spacing: 0.5px !important;
+  padding: 2px 8px !important;
+  border-radius: 3px 3px 0 0 !important;
+  z-index: 2147483646 !important;
+  pointer-events: none !important;
+  line-height: 16px !important;
+}
+
+/* Hover state — intensify */
+.adh-v2-highlighted:hover {
+  outline-color: #ff0000 !important;
+  background-color: rgba(255, 45, 45, 0.12) !important;
+}
+
+/* Dismiss button */
+.adh-v2-dismiss-btn {
+  position: absolute !important;
+  top: -22px !important;
+  right: 4px !important;
+  background: #555 !important;
+  color: white !important;
+  border: none !important;
+  font-size: 10px !important;
+  font-weight: 600 !important;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif !important;
+  padding: 2px 8px !important;
+  border-radius: 3px 3px 0 0 !important;
+  cursor: pointer !important;
+  z-index: 2147483647 !important;
+  line-height: 16px !important;
+  letter-spacing: 0.3px !important;
+  opacity: 0 !important;
+  transition: opacity 0.15s ease, background-color 0.15s ease !important;
+}
+
+.adh-v2-highlighted:hover .adh-v2-dismiss-btn {
+  opacity: 1 !important;
+}
+
+.adh-v2-dismiss-btn:hover {
+  background: #ff6b00 !important;
+}
+
+/* Pulse animation for newly detected ads */
+@keyframes adh-v2-pulse {
+  0% { outline-color: rgba(255, 45, 45, 0.3); }
+  50% { outline-color: rgba(255, 45, 45, 1); }
+  100% { outline-color: rgba(255, 45, 45, 0.8); }
+}
+
+.adh-v2-highlighted {
+  animation: adh-v2-pulse 0.6s ease-out !important;
+}

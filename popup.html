@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      width: 280px;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #1a1a2e;
+      color: #e0e0e0;
+      padding: 16px;
+    }
+
+    .header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 16px;
+    }
+
+    .title {
+      font-size: 15px;
+      font-weight: 700;
+      color: #ff4444;
+      letter-spacing: 0.3px;
+    }
+
+    .version {
+      font-size: 10px;
+      color: #666;
+      font-weight: 400;
+    }
+
+    /* Toggle switch */
+    .toggle-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 12px;
+      background: #16213e;
+      border-radius: 8px;
+      margin-bottom: 12px;
+    }
+
+    .toggle-label {
+      font-size: 13px;
+      font-weight: 500;
+    }
+
+    .toggle {
+      position: relative;
+      width: 40px;
+      height: 22px;
+    }
+
+    .toggle input {
+      opacity: 0;
+      width: 0;
+      height: 0;
+    }
+
+    .toggle-slider {
+      position: absolute;
+      cursor: pointer;
+      top: 0; left: 0; right: 0; bottom: 0;
+      background-color: #444;
+      border-radius: 22px;
+      transition: 0.2s;
+    }
+
+    .toggle-slider:before {
+      content: "";
+      position: absolute;
+      height: 16px;
+      width: 16px;
+      left: 3px;
+      bottom: 3px;
+      background-color: white;
+      border-radius: 50%;
+      transition: 0.2s;
+    }
+
+    input:checked + .toggle-slider {
+      background-color: #ff4444;
+    }
+
+    input:checked + .toggle-slider:before {
+      transform: translateX(18px);
+    }
+
+    /* Stats */
+    .stats {
+      text-align: center;
+      padding: 14px;
+      background: #16213e;
+      border-radius: 8px;
+      margin-bottom: 12px;
+    }
+
+    .stats-count {
+      font-size: 32px;
+      font-weight: 800;
+      color: #ff4444;
+      line-height: 1;
+    }
+
+    .stats-label {
+      font-size: 11px;
+      color: #888;
+      margin-top: 4px;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+    }
+
+    /* Rescan button */
+    .rescan-btn {
+      width: 100%;
+      padding: 8px;
+      background: transparent;
+      color: #888;
+      border: 1px solid #333;
+      border-radius: 6px;
+      font-size: 12px;
+      cursor: pointer;
+      transition: all 0.15s;
+      font-family: inherit;
+    }
+
+    .rescan-btn:hover {
+      color: #ff4444;
+      border-color: #ff4444;
+    }
+
+    .footer {
+      margin-top: 12px;
+      text-align: center;
+      font-size: 10px;
+      color: #444;
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <span class="title">Ad Highlighter <span class="version">v2</span></span>
+  </div>
+
+  <div class="toggle-row">
+    <span class="toggle-label">Detection</span>
+    <label class="toggle">
+      <input type="checkbox" id="enableToggle" checked>
+      <span class="toggle-slider"></span>
+    </label>
+  </div>
+
+  <div class="stats">
+    <div class="stats-count" id="adCount">—</div>
+    <div class="stats-label">ads detected on this page</div>
+  </div>
+
+  <button class="rescan-btn" id="rescanBtn">↻ Rescan Page</button>
+
+  <div class="footer">
+    Hover over highlighted ads to dismiss false positives
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
