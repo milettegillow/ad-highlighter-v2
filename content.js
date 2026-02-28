@@ -443,26 +443,28 @@
     }
   }
 
-  // ---- Facebook: inline badge approach ----
+  // ---- Facebook & Instagram: inline badge approach ----
   // Self-contained — does not touch the `found` set or shared state.
-  // Uses its own WeakSet to track badged elements across rescans.
-  const fbBadged = new WeakSet();
+  // Shared WeakSet prevents double-badging across rescans.
+  const metaBadged = new WeakSet();
 
-  function detectFacebookAds(_found) {
+  function metaBadgeSponsoredLabels(siteName, matchTexts) {
     const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
     let node;
 
     while ((node = walker.nextNode())) {
       const text = node.textContent.trim();
-      if (text !== "Sponsored" && text !== "Ad") continue;
+      if (!matchTexts.includes(text)) continue;
 
       const parent = node.parentElement;
-      if (!parent || fbBadged.has(parent)) continue;
+      if (!parent || metaBadged.has(parent)) continue;
 
-      // Skip hidden elements (rect at 0,0 with no height)
+      // Skip truly hidden elements (offsetParent is null for display:none ancestors)
+      if (parent.offsetParent === null) continue;
+
+      // Skip zero-size elements that are at exactly (0,0) — these are hidden duplicates
       const rect = parent.getBoundingClientRect();
-      if (rect.height === 0 && rect.top === 0) continue;
-      if (rect.height === 0 || rect.top <= 0) continue;
+      if (rect.top === 0 && rect.bottom === 0) continue;
 
       // Make the label bright red
       parent.style.cssText += "color: #ff2d2d !important; font-weight: 700 !important;";
@@ -473,35 +475,17 @@
       badge.style.cssText = "background:#ff2d2d;color:white;font-size:11px;font-weight:700;padding:2px 6px;border-radius:3px;margin-left:6px;z-index:9999;";
       parent.insertAdjacentElement("afterend", badge);
 
-      fbBadged.add(parent);
-      console.log("[AdHighlighter] Facebook: badged", text, "at", rect.top);
+      metaBadged.add(parent);
+      console.log("[AdHighlighter] " + siteName + ": badged", text, "at top:", rect.top, "height:", rect.height, "offsetParent:", parent.offsetParent?.tagName);
     }
   }
 
-  function detectInstagramAds(found) {
-    // "Sponsored" label under username
-    document.querySelectorAll("span").forEach((span) => {
-      if (span.textContent.trim().toLowerCase() === "sponsored") {
-        const article = walkUpTo(span, (el) => el.tagName === "ARTICLE");
-        if (article) {
-          console.log("[AdHighlighter] Instagram: sponsored post found");
-          found.add(article);
-        }
-      }
-    });
+  function detectFacebookAds(_found) {
+    metaBadgeSponsoredLabels("Facebook", ["Sponsored", "Ad"]);
+  }
 
-    // Links to ads about page
-    document
-      .querySelectorAll('a[href*="about/ads"], a[href*="/ads/about"]')
-      .forEach((link) => {
-        const article = walkUpTo(link, (el) => el.tagName === "ARTICLE");
-        if (article) {
-          console.log(
-            "[AdHighlighter] Instagram: ad post via ads-about link",
-          );
-          found.add(article);
-        }
-      });
+  function detectInstagramAds(_found) {
+    metaBadgeSponsoredLabels("Instagram", ["Sponsored"]);
   }
 
   function detectAmazonAds(found) {
@@ -1048,8 +1032,8 @@
 
     if (shouldRescan) {
       clearTimeout(observer._timeout);
-      const isFacebook = /(?:^|\.)facebook\.com$/.test(domain);
-      observer._timeout = setTimeout(() => scanPage(), isFacebook ? 3000 : 500);
+      const isMeta = /(?:^|\.)facebook\.com$/.test(domain) || /(?:^|\.)instagram\.com$/.test(domain);
+      observer._timeout = setTimeout(() => scanPage(), isMeta ? 3000 : 500);
     }
   });
 
