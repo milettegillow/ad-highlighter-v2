@@ -108,6 +108,10 @@
   let dismissedSelectors = new Set();
   const domain = window.location.hostname;
 
+  function isContextValid() {
+    try { return !!chrome.runtime?.id; } catch (e) { return false; }
+  }
+
   chrome.storage.local.get(["enabled", `dismissed_${domain}`], (result) => {
     if (result.enabled === false) {
       enabled = false;
@@ -145,7 +149,7 @@
   // ----------------------------------------------------------
 
   function scanPage() {
-    if (!enabled) return;
+    if (!enabled || !isContextValid()) return;
     const found = new Set();
 
     // Layer 1: Site-specific detection for known sites
@@ -443,45 +447,76 @@
     }
   }
 
-  // ---- Facebook & Instagram: inline badge approach ----
-  // Self-contained — does not touch the `found` set or shared state.
-  // Shared WeakSet prevents double-badging across rescans.
-  const metaBadged = new WeakSet();
+  // ---- Facebook: detect ads with strict validation ----
+  const fbHighlighted = new WeakSet();
 
-  function metaBadgeSponsoredLabels(siteName, matchTexts) {
-    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
-    let node;
+  function detectFacebookAds(found) {
+    // Walk up from signal element to find post container.
+    // Stop at offsetHeight > 500 but never grab feed/main.
+    function fbFindContainer(el) {
+      let current = el;
+      for (let i = 0; i < 15; i++) {
+        current = current.parentElement;
+        if (!current || current === document.body) break;
 
-    while ((node = walker.nextNode())) {
-      const text = node.textContent.trim();
-      if (!matchTexts.includes(text)) continue;
+        // Never highlight the feed or main container
+        const role = current.getAttribute("role");
+        if (role === "feed" || role === "main") break;
 
-      const parent = node.parentElement;
-      if (!parent || metaBadged.has(parent)) continue;
-
-      // Skip truly hidden elements (offsetParent is null for display:none ancestors)
-      if (parent.offsetParent === null) continue;
-
-      // Skip zero-size elements that are at exactly (0,0) — these are hidden duplicates
-      const rect = parent.getBoundingClientRect();
-      if (rect.top === 0 && rect.bottom === 0) continue;
-
-      // Make the label bright red
-      parent.style.cssText += "color: #ff2d2d !important; font-weight: 700 !important;";
-
-      // Add badge
-      const badge = document.createElement("span");
-      badge.textContent = " \u26A0 AD";
-      badge.style.cssText = "background:#ff2d2d;color:white;font-size:11px;font-weight:700;padding:2px 6px;border-radius:3px;margin-left:6px;z-index:9999;";
-      parent.insertAdjacentElement("afterend", badge);
-
-      metaBadged.add(parent);
-      console.log("[AdHighlighter] " + siteName + ": badged", text, "at top:", rect.top, "height:", rect.height, "offsetParent:", parent.offsetParent?.tagName);
+        if (current.offsetHeight > 500) {
+          return current;
+        }
+      }
+      return null;
     }
-  }
 
-  function detectFacebookAds(_found) {
-    metaBadgeSponsoredLabels("Facebook", ["Sponsored", "Ad"]);
+    // Validate: container must have at least one strong ad signal
+    function isConfirmedAd(container) {
+      if (container.querySelector('a[href*="/ads/about"]')) return true;
+      if (container.querySelector('[data-ad-rendering-role^="cta"]')) return true;
+      if (container.querySelector('a[aria-label*="Sponsored"]')) return true;
+      return false;
+    }
+
+    // Check if container (or any ancestor/descendant) is already tracked
+    function isAlreadyHighlighted(container) {
+      if (fbHighlighted.has(container)) return true;
+      let parent = container.parentElement;
+      while (parent && parent !== document.body) {
+        if (fbHighlighted.has(parent)) return true;
+        parent = parent.parentElement;
+      }
+      if (container.querySelector(".adh-v2-highlighted")) return true;
+      return false;
+    }
+
+    function addContainer(container, signal) {
+      if (!container || isAlreadyHighlighted(container)) return;
+      if (!isConfirmedAd(container)) return;
+      fbHighlighted.add(container);
+      console.log("[AdHighlighter] Facebook:", signal, "container:", container.offsetWidth, "x", container.offsetHeight);
+      found.add(container);
+    }
+
+    // Primary: /ads/about links (hidden but present in DOM)
+    document.querySelectorAll('a[href*="/ads/about"]').forEach((link) => {
+      const container = fbFindContainer(link);
+      addContainer(container, "found /ads/about link");
+    });
+
+    // Secondary: aria-label="Sponsored" links
+    document.querySelectorAll('a[aria-label*="Sponsored"]').forEach((link) => {
+      const container = fbFindContainer(link);
+      addContainer(container, "found aria-label Sponsored link");
+    });
+
+    // Tertiary: data-ad-comet-preview WITH strict CTA validation
+    document.querySelectorAll("[data-ad-comet-preview]").forEach((el) => {
+      const container = fbFindContainer(el);
+      if (container && container.querySelector('[data-ad-rendering-role^="cta"]')) {
+        addContainer(container, "found data-ad-comet-preview with CTA");
+      }
+    });
   }
 
   // ---- Instagram: find "Ad" spans, walk up to <article>, highlight ----
@@ -558,9 +593,111 @@
     });
   }
 
-  function detectLinkedInAds(found) {
-    // Use TreeWalker to scan ALL text nodes for "Promoted" label.
-    // LinkedIn nests the label deeply in spans that querySelectorAll may miss.
+  // ---- LinkedIn: overlay approach ----
+  // LinkedIn's stacking contexts can hide CSS-based highlights.
+  // We create position:absolute overlays on document.body instead.
+
+  function linkedinCreateOverlay(el, label) {
+    const rect = el.getBoundingClientRect();
+    if (rect.width === 0 || rect.height === 0) return;
+
+    const top = Math.round(rect.top + window.scrollY);
+    const left = Math.round(rect.left + window.scrollX);
+
+    // Dedup: skip if an overlay already exists within 50px of this position
+    for (const [, data] of highlightedElements) {
+      if (data.isLinkedInOverlay && Math.abs(data.overlayTop - top) < 50 && Math.abs(data.overlayLeft - left) < 50) {
+        return;
+      }
+    }
+
+    const overlay = document.createElement("div");
+    overlay.className = "adh-v2-linkedin-overlay";
+    overlay.style.cssText = [
+      "position: absolute",
+      "top: " + top + "px",
+      "left: " + left + "px",
+      "width: " + Math.round(rect.width) + "px",
+      "height: " + Math.round(rect.height) + "px",
+      "border: 4px solid #ff2d2d",
+      "background: rgba(255, 45, 45, 0.08)",
+      "pointer-events: none",
+      "z-index: 2147483647",
+      "border-radius: 8px",
+      "box-sizing: border-box",
+    ].join(" !important;") + " !important";
+
+    const badge = document.createElement("div");
+    badge.textContent = "\u26A0 AD DETECTED";
+    badge.style.cssText = [
+      "position: absolute",
+      "bottom: -28px",
+      "left: 0",
+      "background: #ff2d2d",
+      "color: white",
+      "font-size: 12px",
+      "font-weight: 700",
+      "padding: 4px 10px",
+      "border-radius: 4px",
+      "pointer-events: none",
+      "font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif",
+      "letter-spacing: 0.3px",
+      "line-height: 16px",
+    ].join(" !important;") + " !important";
+    overlay.appendChild(badge);
+
+    const btn = document.createElement("button");
+    btn.className = "adh-v2-dismiss-btn";
+    btn.textContent = "\u2715 Not an ad";
+    btn.title = "Dismiss \u2014 this is not an ad";
+    btn.style.cssText = "pointer-events: auto !important;";
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      e.preventDefault();
+      dismissElement(overlay);
+    });
+    overlay.appendChild(btn);
+
+    document.body.appendChild(overlay);
+    highlightedElements.set(overlay, { btn, isLinkedInOverlay: true, sourceEl: el, overlayTop: top, overlayLeft: left });
+
+    console.log("[AdHighlighter] LinkedIn: created overlay for " + label, {
+      top,
+      width: Math.round(rect.width),
+      height: Math.round(rect.height),
+    });
+  }
+
+  function detectLinkedInAds(_found) {
+    // Walk up to find the feed post container
+    function findFeedPostContainer(el) {
+      let current = el;
+      for (let i = 0; i < 12; i++) {
+        current = current.parentElement;
+        if (!current || current === document.body) break;
+        if (current.tagName === "MAIN" || current.getAttribute("role") === "main") break;
+
+        // Skip composer UI
+        if (current.querySelector('input, textarea, [contenteditable="true"]')) continue;
+
+        const hasDataUrn = current.getAttribute("data-urn") !== null;
+        const hasDataId = current.getAttribute("data-id") !== null && current.tagName === "DIV";
+        const cls = (typeof current.className === "string" ? current.className : "").toLowerCase();
+        const isFeedUpdate = cls.includes("feed-shared-update") || cls.includes("occludable-update");
+
+        if (hasDataUrn || hasDataId || isFeedUpdate) {
+          // Validate: should not contain more than one Like button (multiple = too high)
+          const likeButtons = current.querySelectorAll('button[aria-label*="Like"], button[aria-label*="like"]');
+          if (likeButtons.length > 1) continue;
+          return current;
+        }
+      }
+      return null;
+    }
+
+    const adElements = new Set();
+
+    // --- Feed: "Promoted by" text ---
     const walker = document.createTreeWalker(
       document.body,
       NodeFilter.SHOW_TEXT,
@@ -575,94 +712,208 @@
       const parentEl = textNode.parentElement;
       if (!parentEl) continue;
 
-      console.log("[AdHighlighter] LinkedIn: found 'Promoted' text node in <" + parentEl.tagName.toLowerCase() + ">", {
-        class: parentEl.className,
-        parentTag: parentEl.parentElement?.tagName,
-        parentClass: parentEl.parentElement?.className,
+      // Skip sidebar — handle separately below
+      if (parentEl.closest("aside") || parentEl.closest('[role="complementary"]')) continue;
+      if (parentEl.closest('[data-testid="promoted-badge"]')) continue;
+
+      // Verify this is "Promoted by ..." — not just "Promoted" alone
+      let isPromotedBy = false;
+      if (/^promoted\s+by\s/i.test(trimmedText)) {
+        isPromotedBy = true;
+      } else if (trimmedText.toLowerCase() === "promoted") {
+        // Check if "by" follows in parent/grandparent text
+        const parent = textNode.parentElement;
+        if (parent) {
+          const fullText = parent.textContent.trim().toLowerCase();
+          if (fullText.startsWith("promoted") && fullText.includes(" by ")) {
+            isPromotedBy = true;
+          }
+          if (!isPromotedBy && parent.parentElement) {
+            const grandText = parent.parentElement.textContent.trim().toLowerCase();
+            if (/^promoted\b/.test(grandText) && grandText.includes(" by ")) {
+              isPromotedBy = true;
+            }
+          }
+        }
+      }
+
+      if (!isPromotedBy) continue;
+
+      console.log("[AdHighlighter] LinkedIn: found 'Promoted by' text", {
+        text: trimmedText.substring(0, 40),
+        parentTag: parentEl.tagName,
       });
 
-      // Walk up to feed post container. LinkedIn uses several patterns:
-      //   - div[data-urn] (post URN identifier)
-      //   - div[data-id] (alternative post identifier)
-      //   - div with class containing "feed-shared-update"
-      //   - div with class containing "occludable-update"
-      const post = walkUpTo(parentEl, (el) => {
-        if (el.getAttribute("data-urn") !== null) return true;
-        if (el.getAttribute("data-id") !== null && el.tagName === "DIV")
-          return true;
-        const cls = (
-          typeof el.className === "string" ? el.className : ""
-        ).toLowerCase();
-        if (cls.includes("feed-shared-update")) return true;
-        if (cls.includes("occludable-update")) return true;
-        return false;
-      }, 20);
-
-      if (post) {
-        console.log("[AdHighlighter] LinkedIn: promoted post container", {
-          tag: post.tagName,
-          class: post.className,
-          dataUrn: post.getAttribute("data-urn"),
-          dataId: post.getAttribute("data-id"),
+      const container = findFeedPostContainer(parentEl);
+      if (container && !container.getAttribute("data-ad-highlighted")) {
+        container.setAttribute("data-ad-highlighted", "true");
+        console.log("[AdHighlighter] LinkedIn: feed promoted post", {
+          tag: container.tagName,
+          dataUrn: container.getAttribute("data-urn"),
+          w: container.offsetWidth,
+          h: container.offsetHeight,
         });
-        found.add(post);
-      } else {
-        // Fallback: try to find a reasonable ancestor that looks like a card
-        // but NOT a UI element (composer, nav, etc.)
-        const card = walkUpTo(parentEl, (el) => {
-          // Skip if it has input elements (composer UI)
-          if (el.querySelector('input, textarea, [contenteditable="true"]'))
-            return false;
-          // Look for a substantial div with limited children
-          if (el.tagName !== "DIV" && el.tagName !== "SECTION") return false;
-          const rect = el.getBoundingClientRect();
-          return rect.height > 100 && el.children.length >= 2 && el.children.length <= 30;
-        }, 15);
-
-        if (card) {
-          console.log("[AdHighlighter] LinkedIn: promoted card (fallback)", {
-            tag: card.tagName,
-            class: card.className,
-          });
-          found.add(card);
-        } else {
-          console.log("[AdHighlighter] LinkedIn: 'Promoted' found but no suitable container");
-        }
+        adElements.add(container);
       }
     }
 
-    // Also check for sidebar ad units with explicit ad markers
-    document
-      .querySelectorAll('[data-ad-banner], [data-test-id*="ad"], .ad-banner-container')
-      .forEach((el) => {
-        console.log("[AdHighlighter] LinkedIn: sidebar ad banner", {
-          tag: el.tagName,
-          class: el.className,
+    // --- Sidebar: promoted company cards ---
+    // Signal 1: data-testid="promoted-badge"
+    document.querySelectorAll('[data-testid="promoted-badge"]').forEach((badge) => {
+      const container = badge.closest('[data-testid="follow-company-container"]') ||
+                        badge.closest("#ads-container") ||
+                        badge.closest("aside");
+      if (container && !container.getAttribute("data-ad-highlighted")) {
+        container.setAttribute("data-ad-highlighted", "true");
+        console.log("[AdHighlighter] LinkedIn: sidebar promoted card", {
+          tag: container.tagName,
+          id: container.id,
+          w: container.offsetWidth,
+          h: container.offsetHeight,
         });
-        found.add(el);
-      });
-  }
-
-  function detectTwitterAds(found) {
-    // "Ad" label in tweet metadata (near the timestamp/username)
-    document.querySelectorAll("span").forEach((span) => {
-      if (span.textContent.trim().toLowerCase() === "ad") {
-        console.log("[AdHighlighter] Twitter: found 'Ad' span", {
-          class: span.className,
-          parentTag: span.parentElement?.tagName,
-          parentClass: span.parentElement?.className,
-        });
-        const article = walkUpTo(span, (el) => el.tagName === "ARTICLE");
-        if (article) {
-          console.log("[AdHighlighter] Twitter: flagging ad tweet");
-          found.add(article);
-        } else {
-          console.log(
-            "[AdHighlighter] Twitter: 'Ad' span found but no article ancestor, skipping",
-          );
-        }
+        adElements.add(container);
       }
     });
+
+    // Signal 2: direct container selectors
+    document.querySelectorAll('#ads-container, [data-testid="follow-company-container"]').forEach((el) => {
+      if (!el.getAttribute("data-ad-highlighted")) {
+        el.setAttribute("data-ad-highlighted", "true");
+        console.log("[AdHighlighter] LinkedIn: sidebar ad container", {
+          tag: el.tagName,
+          id: el.id,
+          testId: el.getAttribute("data-testid"),
+        });
+        adElements.add(el);
+      }
+    });
+
+    // Deduplicate and create overlays
+    const unique = [...adElements].filter((el) => {
+      return ![...adElements].some((other) => other !== el && other.contains(el));
+    });
+
+    for (const el of unique) {
+      const inSidebar = el.closest("aside") || el.closest('[role="complementary"]') ||
+                        el.id === "ads-container" || el.getAttribute("data-testid") === "follow-company-container";
+      linkedinCreateOverlay(el, inSidebar ? "sidebar ad" : "feed ad");
+    }
+  }
+
+  // ---- Twitter/X: overlay approach ----
+  // Twitter's stacking contexts hide CSS-based highlights behind cards.
+  // We create position:absolute overlays on document.body instead.
+
+  function twitterCreateOverlay(el) {
+    const rect = el.getBoundingClientRect();
+    if (rect.width === 0 || rect.height === 0) return;
+
+    const top = Math.round(rect.top + window.scrollY);
+    const left = Math.round(rect.left + window.scrollX);
+
+    // Dedup: skip if an overlay already exists within 50px of this position
+    for (const [, data] of highlightedElements) {
+      if (data.isTwitterOverlay && Math.abs(data.overlayTop - top) < 50 && Math.abs(data.overlayLeft - left) < 50) {
+        return;
+      }
+    }
+
+    const overlay = document.createElement("div");
+    overlay.className = "adh-v2-twitter-overlay";
+    overlay.style.cssText = [
+      "position: absolute",
+      "top: " + top + "px",
+      "left: " + left + "px",
+      "width: " + Math.round(rect.width) + "px",
+      "height: " + Math.round(rect.height) + "px",
+      "border: 4px solid #ff2d2d",
+      "background: rgba(255, 45, 45, 0.08)",
+      "pointer-events: none",
+      "z-index: 2147483647",
+      "border-radius: 12px",
+      "box-sizing: border-box",
+    ].join(" !important;") + " !important";
+
+    const badge = document.createElement("div");
+    badge.textContent = "\u26A0 AD DETECTED";
+    badge.style.cssText = [
+      "position: absolute",
+      "bottom: -28px",
+      "left: 0",
+      "background: #ff2d2d",
+      "color: white",
+      "font-size: 12px",
+      "font-weight: 700",
+      "padding: 4px 10px",
+      "border-radius: 4px",
+      "pointer-events: none",
+      "font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif",
+      "letter-spacing: 0.3px",
+      "line-height: 16px",
+    ].join(" !important;") + " !important";
+    overlay.appendChild(badge);
+
+    const btn = document.createElement("button");
+    btn.className = "adh-v2-dismiss-btn";
+    btn.textContent = "\u2715 Not an ad";
+    btn.title = "Dismiss \u2014 this is not an ad";
+    btn.style.cssText = "pointer-events: auto !important;";
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      e.preventDefault();
+      dismissElement(overlay);
+    });
+    overlay.appendChild(btn);
+
+    document.body.appendChild(overlay);
+    highlightedElements.set(overlay, { btn, isTwitterOverlay: true, sourceEl: el, overlayTop: top, overlayLeft: left });
+
+    console.log("[AdHighlighter] Twitter: created overlay", {
+      top,
+      width: Math.round(rect.width),
+      height: Math.round(rect.height),
+    });
+  }
+
+  function detectTwitterAds(_found) {
+    // Walk up to Twitter's tweet container
+    function findTweetContainer(el) {
+      return walkUpTo(el, (ancestor) => {
+        const testId = ancestor.getAttribute("data-testid");
+        return testId === "tweet" || testId === "tweetText";
+      }, 15);
+    }
+
+    const adElements = new Set();
+
+    // Signal 1: "Ad" text spans (exact case — Twitter uses capital A)
+    document.querySelectorAll("span").forEach((span) => {
+      if (span.textContent.trim() === "Ad") {
+        const container = findTweetContainer(span);
+        if (container) adElements.add(container);
+      }
+    });
+
+    // Signal 2: /i/ads links
+    document.querySelectorAll('a[href*="/i/ads"]').forEach((link) => {
+      const container = findTweetContainer(link);
+      if (container) adElements.add(container);
+    });
+
+    // Signal 3: promotedIndicator data-testid
+    document.querySelectorAll('[data-testid="promotedIndicator"]').forEach((el) => {
+      const container = findTweetContainer(el);
+      if (container) adElements.add(container);
+    });
+
+    // Deduplicate and create overlays (not CSS highlights)
+    const unique = [...adElements].filter((el) => {
+      return ![...adElements].some((other) => other !== el && other.contains(el));
+    });
+
+    for (const el of unique) {
+      twitterCreateOverlay(el);
+    }
   }
 
   function detectRedditAds(found) {
@@ -960,7 +1211,7 @@
 
   function dismissElement(el) {
     const data = highlightedElements.get(el);
-    if (data && data.isYtOverlay) {
+    if (data && (data.isYtOverlay || data.isTwitterOverlay || data.isLinkedInOverlay)) {
       el.remove();
       highlightedElements.delete(el);
       updateBadge();
@@ -1018,7 +1269,7 @@
 
   function clearAllHighlights() {
     highlightedElements.forEach((data, el) => {
-      if (data.isYtOverlay) {
+      if (data.isYtOverlay || data.isTwitterOverlay || data.isLinkedInOverlay) {
         el.remove();
       } else {
         el.classList.remove("adh-v2-highlighted");
@@ -1046,8 +1297,10 @@
   // 6. MUTATION OBSERVER (catch dynamically loaded ads)
   // ----------------------------------------------------------
 
+  const isFacebook = /(?:^|\.)facebook\.com$/.test(domain);
+
   const observer = new MutationObserver((mutations) => {
-    if (!enabled) return;
+    if (!enabled || !isContextValid()) return;
 
     let shouldRescan = false;
     for (const mutation of mutations) {
@@ -1058,11 +1311,25 @@
     }
 
     if (shouldRescan) {
-      clearTimeout(observer._timeout);
-      const isFacebook = /(?:^|\.)facebook\.com$/.test(domain);
-      const isInstagram = /(?:^|\.)instagram\.com$/.test(domain);
-      const throttle = isFacebook ? 3000 : isInstagram ? 1000 : 500;
-      observer._timeout = setTimeout(() => scanPage(), throttle);
+      if (isFacebook) {
+        // Throttle: run at most once per 500ms (not debounce)
+        const now = Date.now();
+        if (now - (observer._lastFbScan || 0) >= 500) {
+          observer._lastFbScan = now;
+          scanPage();
+        } else if (!observer._fbThrottleTimeout) {
+          observer._fbThrottleTimeout = setTimeout(() => {
+            observer._lastFbScan = Date.now();
+            observer._fbThrottleTimeout = null;
+            scanPage();
+          }, 500 - (now - (observer._lastFbScan || 0)));
+        }
+      } else {
+        clearTimeout(observer._timeout);
+        const isInstagram = /(?:^|\.)instagram\.com$/.test(domain);
+        const throttle = isInstagram ? 1000 : 500;
+        observer._timeout = setTimeout(() => scanPage(), throttle);
+      }
     }
   });
 
@@ -1075,6 +1342,7 @@
   if (/(?:^|\.)linkedin\.com$/.test(domain)) {
     let lastScrollScan = 0;
     window.addEventListener("scroll", () => {
+      if (!isContextValid()) return;
       if (Date.now() - lastScrollScan > 2000) {
         lastScrollScan = Date.now();
         scanPage();
@@ -1082,10 +1350,40 @@
     });
   }
 
+  // Facebook: scroll rescan + timed initial rescans for progressive feed loading
+  if (isFacebook) {
+    let lastScrollScan = 0;
+    window.addEventListener("scroll", () => {
+      if (!isContextValid()) return;
+      if (Date.now() - lastScrollScan > 1000) {
+        lastScrollScan = Date.now();
+        scanPage();
+      }
+    });
+    // Immediate + timed rescans to catch initial batch of ads
+    scanPage();
+    setTimeout(() => scanPage(), 500);
+    setTimeout(() => scanPage(), 1500);
+    setTimeout(() => scanPage(), 3000);
+  }
+
   // Instagram: rescan on scroll — DOM elements are recycled on scroll
   if (/(?:^|\.)instagram\.com$/.test(domain)) {
     let lastScrollScan = 0;
     window.addEventListener("scroll", () => {
+      if (!isContextValid()) return;
+      if (Date.now() - lastScrollScan > 1500) {
+        lastScrollScan = Date.now();
+        scanPage();
+      }
+    });
+  }
+
+  // Twitter/X: rescan on scroll — DOM elements are replaced on scroll
+  if (/(?:^|\.)twitter\.com$/.test(domain) || /(?:^|\.)x\.com$/.test(domain)) {
+    let lastScrollScan = 0;
+    window.addEventListener("scroll", () => {
+      if (!isContextValid()) return;
       if (Date.now() - lastScrollScan > 1500) {
         lastScrollScan = Date.now();
         scanPage();
