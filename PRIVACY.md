@@ -12,7 +12,19 @@ This extension **collects no personal data**. It does not collect browsing histo
 
 ## Network requests
 
-This extension **makes no network requests**. It does not communicate with any external servers, APIs, analytics services, or third-party endpoints. All ad detection logic runs entirely within your browser.
+All ad detection logic runs entirely within your browser — no network requests are made during detection. The only network requests the extension makes are the anonymous error reports described below, sent when a user explicitly clicks "Not an ad" or "Flag as ad."
+
+## Anonymous error reporting
+
+When a user clicks "Not an ad" (to dismiss a false detection) or "Flag as ad" (to report a missed ad), the extension sends a minimal anonymous report to help improve detection accuracy. This report contains only:
+
+- The website hostname (e.g. "linkedin.com")
+- The page URL (truncated)
+- The action taken ("dismissed" or "flagged")
+- A short text snippet from the element (up to 200 characters)
+- A timestamp
+
+No personal data, account information, cookies, or browsing history is collected. Reports are sent to a private Google Form and stored in a Google Sheet accessible only to the developer. No third parties have access to this data.
 
 ## Data storage
 
@@ -25,7 +37,7 @@ This data remains on your device and is never transmitted anywhere.
 
 ## Third-party sharing
 
-This extension **does not share any information with third parties**. There are no analytics, no advertising SDKs, no telemetry, and no data brokers involved.
+This extension **does not share any information with third parties**. Anonymous error reports (described above) are stored in a private Google Sheet accessible only to the developer. There are no analytics, no advertising SDKs, no telemetry, and no data brokers involved.
 
 ## How it works
 

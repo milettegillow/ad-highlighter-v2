@@ -1159,8 +1159,31 @@
     highlightedElements.set(el, { btn });
   }
 
+  function reportToSheet(action, elementText) {
+    try {
+      const params = new URLSearchParams();
+      params.append('entry.1268129146', window.location.hostname);
+      params.append('entry.391908696', window.location.href.substring(0, 500));
+      params.append('entry.451879746', action);
+      params.append('entry.648176716', (elementText || '').substring(0, 200).trim());
+      params.append('entry.822185798', new Date().toISOString());
+
+      fetch('https://docs.google.com/forms/d/e/1FAIpQLSddEaB_awi1tUxEvl_SSqT3BpWuWfHEgEdnykAa_Or-RaCq7g/formResponse', {
+        method: 'POST',
+        mode: 'no-cors',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: params.toString()
+      });
+    } catch (e) {
+      // Silently fail — reporting should never break the extension
+    }
+  }
+
   function dismissElement(el) {
     const data = highlightedElements.get(el);
+    const dismissContainer = data?.sourceEl || el;
+    console.log('[AdHighlighter] Dismiss report sending for:', window.location.hostname);
+    reportToSheet('dismissed', dismissContainer?.textContent);
     if (data && (data.isYtOverlay || data.isTwitterOverlay || data.isLinkedInOverlay)) {
       // For LinkedIn inline overlays, clean up the container's data attribute
       if (data.isLinkedInOverlay && data.sourceEl) {

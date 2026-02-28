@@ -68,8 +68,29 @@ function activateFlagMode() {
     if (hoveredEl) {
       hoveredEl.style.outline = "";
       hoveredEl.classList.add("adh-v2-highlighted");
+      reportToSheet('flagged-missed-ad', hoveredEl.textContent || 'unknown');
     }
     cleanup();
+  }
+
+  function reportToSheet(action, elementText) {
+    try {
+      const params = new URLSearchParams();
+      params.append('entry.1268129146', window.location.hostname);
+      params.append('entry.391908696', window.location.href.substring(0, 500));
+      params.append('entry.451879746', action);
+      params.append('entry.648176716', (elementText || '').substring(0, 200).trim());
+      params.append('entry.822185798', new Date().toISOString());
+
+      fetch('https://docs.google.com/forms/d/e/1FAIpQLSddEaB_awi1tUxEvl_SSqT3BpWuWfHEgEdnykAa_Or-RaCq7g/formResponse', {
+        method: 'POST',
+        mode: 'no-cors',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: params.toString()
+      });
+    } catch (e) {
+      // Silently fail
+    }
   }
 
   function onKeyDown(e) {
