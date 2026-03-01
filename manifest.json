@@ -2,13 +2,8 @@
   "manifest_version": 3,
   "name": "Ad Highlighter v2",
   "version": "2.0.0",
-  "description": "Intelligently detects and highlights ads on any webpage",
-  "permissions": [
-    "activeTab",
-    "storage",
-    "contextMenus",
-    "scripting"
-  ],
+  "description": "Detects and highlights ads and sponsored content across major platforms",
+  "permissions": ["activeTab", "storage", "contextMenus", "scripting"],
   "host_permissions": [
     "*://*.google.com/*",
     "*://*.google.co.uk/*",
